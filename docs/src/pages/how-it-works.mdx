@@ -32,9 +32,9 @@ description: The RSW timelock + Wesolowski proof flow, end to end.
    Wesolowski proof:
 
    ```text
-   L = H(x, y, T)              challenge from the transcript
+   L = poseidon(N, x, y, T)      challenge from the instance
    q = floor(2^T / L),  r = 2^T mod L
-   π = x^q mod N               the proof
+   π = x^q mod N                 the proof
    ```
 
 4. **Verify (O(log T)).** A verifier checks one equation:
@@ -43,8 +43,10 @@ description: The RSW timelock + Wesolowski proof flow, end to end.
    y == π^L · x^r  (mod N)
    ```
 
-   Only two modular exponentiations with 256-bit exponents are needed —
-   milliseconds, not T squarings.
+   Only two modular exponentiations with ~256-bit exponents are needed —
+   milliseconds, not T squarings. The challenge `L` is derived inside the
+   verifier itself (in-program, from the instance) so the prover cannot pick
+   a favorable one — see *Concepts → Wesolowski VDF*.
 
 ## Why the encryptor isn't a trusted party
 

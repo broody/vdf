@@ -53,8 +53,18 @@ flowchart LR
 
 ## Production notes
 
-- **Bind L onchain**: production must derive the Wesolowski challenge
-  `L = H(x, y, T)` in the contract (Poseidon), not accept it as input.
+- **The challenge is already bound in-program**: the verifier derives
+  `L = poseidon(N, x, y, T)` itself and validates both Barrett constants, so
+  a prover cannot choose `L` (or a bogus `mu`) to fit a forged `y`. The
+  executable outputs `poseidon(N, x, y, T)` on success — the contract treats
+  `(N, x, y, T)` as public inputs and compares that hash, binding the Stwo
+  proof to the exact instance.
+- **Settlement does not need a VDF proof per bid**: the VDF guarantees the
+  key is *available* to anyone at the deadline; settlement only needs a valid
+  commitment opening (amount + salt). A solver decrypts offchain and submits
+  the opening with a plain `reveal_bid`. The Stwo proof of the VDF
+  verification is only for the permissionless/disputed path (e.g. forcing a
+  no-show's bid open with onchain finality).
 - **T calibration**: choose T so the deadline lands after
   `force_reveal_after` with margin; fast machines solve faster.
 - **Modulus size**: 2048-bit for production (`N_LIMBS = 32`), which needs a

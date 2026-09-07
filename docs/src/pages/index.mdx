@@ -38,17 +38,17 @@ flowchart LR
   force-reveal at the deadline.
 - **Provable**: the reveal computation can be proven with Stwo and verified
   onchain via the Cairo recursive verifier — a Starknet tx never runs the
-  ~billion-step computation, it verifies a small proof.
+  ~46M-step (1024-bit) computation, it verifies a small proof.
 
 ## Repository layout
 
 ```
 cairo/
-  lib/   # bigint + Wesolowski verifier (u64 limbs, u256 accumulation, Barrett)
+  lib/   # bigint + Wesolowski verifier (u64 limbs, u128 column accumulation, Barrett)
   exec/  # #[executable] vdf_verify entrypoint, depends on lib
-ref/     # Python reference implementation + exact Cairo-algorithm model
+ref/     # Python reference + exact Cairo-algorithm model + Poseidon (cross-checked with Cairo)
 vectors/ # test vectors (RSW keys + Wesolowski proofs)
-scripts/ # generators: vectors, Cairo tests, executable args
+scripts/ # generators: vectors, Cairo tests, executable args; bug repros
 skill/   # the Hermes skill for this work (SKILL.md + references + scripts)
 ```
 
@@ -56,7 +56,10 @@ skill/   # the Hermes skill for this work (SKILL.md + references + scripts)
 
 - [x] Python reference + vectors (RSW + Wesolowski)
 - [x] Cairo verifier (`lib`) + `#[executable]` entrypoint (`exec`)
-- [x] `scarb execute` → output `1` on 256/512/1024-bit vectors
+- [x] In-program Fiat-Shamir challenge + Barrett constant validation (soundness)
+- [x] Barrett k+1-limb normalization (HAC 14.42) + boundary regression tests
+- [x] `scarb execute` → instance hash on 512/1024-bit vectors (14.8M / 45.7M steps)
 - [x] `scarb execute --output=standard` → prover input
-- [ ] `scarb prove` (verified working on the pipeline; needs 16GB+ machine)
+- [x] `scarb prove` (512-bit verified end-to-end; ~90s / 590MB proof on a 64GB box)
+- [ ] `scarb verify` (blocked: upstream stwo-cairo#1733 ECDSA-segment panic; proof artifact is valid)
 - [ ] Onchain recursive-verifier integration

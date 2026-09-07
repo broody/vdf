@@ -14,7 +14,7 @@ equation check.
 After computing `y = x^(2^T) mod N`, the prover additionally computes:
 
 ```text
-L = H(x, y, T)             hash-derived challenge (256-bit)
+L = poseidon(N, x, y, T)   Fiat-Shamir challenge (251-bit, bit 192 forced)
 q = floor(2^T / L)         quotient
 r = 2^T mod L              remainder
 π = x^q mod N              the proof
@@ -29,9 +29,9 @@ x^(2^T) = x^(q·L + r) = (x^q)^L · x^r = π^L · x^r   (mod N)
 ## The verification
 
 ```text
-L = H(x, y, T)
+L = poseidon(N, x, y, T)          ← derived in-program
 r = 2^T mod L                     ← cheap: pow(2, T, L)
-check  π^L · x^r == y  (mod N)    ← two modpows, 256-bit exponents
+check  π^L · x^r == y  (mod N)    ← two modpows, ~256-bit exponents
 ```
 
 The verifier never performs the T squarings. It checks a statement about them
@@ -39,16 +39,32 @@ in O(log T) group operations.
 
 ## Why the challenge L matters
 
-L must be derived from the transcript `(x, y, T)` — never chosen by the prover.
-If the prover could pick L, they could fake the proof. In the current repo, L
-is computed offchain and passed into the Cairo verifier; **production must
-derive L onchain** (Poseidon is cheap in Cairo) so the prover cannot choose a
-favorable challenge.
+L must be derived from the instance `(N, x, y, T)` — never chosen by the
+prover. If the prover could pick L, they could fake the proof for **any**
+claimed output: choosing `L = 2^200` (which divides `2^T` for `T ≥ 200`) makes
+`r = 0`, and then `π = 1` "proves" `y = 1` without a single squaring. This
+repo's Cairo verifier therefore derives `L = poseidon(N, x, y, T)` **inside
+the proven program** — binding it onchain is not an option, because the
+onchain side only verifies a proof of execution and cannot re-derive L itself.
+Bit 192 of L is forced so `L ≥ 2^192` always satisfies the Barrett
+precondition, and both Barrett constants are validated in-program.
+`scripts/repro_issues.py` demonstrates the forgery against the old interface;
+`forged_output_rejected` in the test suite pins the fix.
+
+Like the Python reference (and Pietrzak's ePrint 2018/627, §4), `L` is a
+random ~251-bit integer rather than a verified prime. Wesolowski's soundness
+proof assumes a prime challenge; with a random challenge the known attacks
+require the prover to factor an RSA-sized integer (`N`, or `L − 1` when it
+factors `N`) — no cheaper than attacking the RSW timelock itself. If you want
+the theorem-level guarantee, generate a prime `L` offchain and add a primality
+certificate check in-program (larger trace; not done here).
 
 ## In this repo
 
 - `ref/cairo_model_v2.py` — exact Python mirror of the Cairo verification
   algorithm (validates any change before porting).
-- `cairo/lib/src/lib.cairo` — `verify_vdf`: recompute `r = 2^T mod L`, then
-  check `pi^L · x^r == y mod N`.
-- `cairo/exec` — `#[executable] vdf_verify` entrypoint for the proving pipeline.
+- `cairo/lib/src/lib.cairo` — `verify_vdf`: validate the Barrett constants,
+  derive `L`, compute `r = 2^T mod L`, then check `pi^L · x^r == y mod N`.
+- `cairo/exec` — `#[executable] vdf_verify` entrypoint for the proving
+  pipeline; outputs `poseidon(N, x, y, T)` on success so the onchain verifier
+  can bind the proof to the public instance.

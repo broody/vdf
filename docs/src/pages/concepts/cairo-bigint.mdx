@@ -1,6 +1,6 @@
 ---
 title: Cairo bigint
-description: Why Cairo needs u64/u256 limbs instead of felt252, and the Barrett reduction pattern used here.
+description: Why Cairo needs u64/u128 limb arithmetic instead of felt252, and the Barrett reduction pattern used here.
 ---
 
 # Cairo bigint
@@ -12,26 +12,41 @@ arithmetic on it directly. This repo uses a validated pattern:
 ## Representation
 
 - **Limbs**: `u64`, little-endian.
-- **Multiplication**: accumulate in `u256` (products of two u64 fit; sums of
-  ≤17 products stay well under 2^256).
-- **Carry**: `acc & 0xffffffffffffffff_u256` → limb, `acc / 2^64` → carry
-  (constant-divisor division on u256 is integer division).
+- **Multiplication**: schoolbook columns, each accumulated in a `(hi, lo)`
+  u128 pair — `u64×u64→u128` products are native, column overflows count into
+  `hi` via `u128_overflowing_add`. Only contributing `(i, j)` pairs are
+  visited, and products are truncated to the low columns the caller actually
+  reads (Barrett's `q3·N`). This cut the 512-bit verify from 40.0M to ~14.8M
+  Cairo steps versus generic `u256` accumulation.
+- **Carry**: `lo & 0xffffffffffffffff` → limb, `hi·2^64 + lo/2^64` → carry
+  (constant-divisor division on u128 is integer division).
 - **Subtraction with borrow**: compute in `u128`; the borrow applies to the
   **subtrahend**, not the minuend (a real bug caught by the Python model).
-- **Bit scan in modpow**: `e % 2` / `e / 2` loop on u64 (not shifts).
+- **Bit scan in modpow**: `e % 2` / `e / 2` loop on u64 (not shifts);
+  trailing zero limbs/bits of the exponent are skipped.
 
-## Barrett reduction
+## Barrett reduction (HAC 14.42)
 
 To reduce a 2k-limb product modulo a k-limb modulus N:
 
 ```text
-mu = floor(b^(2k) / N)   computed offchain, k+1 limbs
+mu = floor(b^(2k) / N)   computed offchain, k+1 limbs — VALIDATED in-program
+                         (mu·N <= b^(2k) < (mu+1)·N; an unvalidated mu is an
+                         attacker-controlled reduction)
 q1 = p >> (k-1)
 q2 = q1 * mu
 q3 = q2 >> (k+1)
-r  = p - q3*N   mod b^k
-while r >= N: r -= N     (at most 2 iterations)
+r  = p - q3*N   mod b^(k+1)      ← k+1 limbs, exact
+while r >= N: r -= N             (at most 2 iterations)
 ```
+
+The `k+1`-limb `r` is load-bearing: the quotient estimate undershoots by at
+most 2, so `0 <= p − q3·N < 3N < b^(k+1)` and nothing wraps. Truncating `r`
+to `k` limbs breaks reduction whenever `p − q3·N >= b^k` (e.g. `N = 2^512−1`,
+`a = 2^448−1`, `b = 2^448+1` returns `p mod N − 1`). Rare for honest RSA
+moduli — but in the RSW setting **N is chosen by the bidder**, so the
+primitive must be correct for every modulus. Regression test:
+`barrett_boundary_top_limb_all_ones`; sweeps: `scripts/hunt_barrett.py`.
 
 ## Per-modulus limb domains
 
@@ -40,7 +55,7 @@ Each modulus gets its own limb count and Barrett constant:
 | Modulus | Size | Limbs |
 |---|---|---|
 | N (RSA modulus) | 512-bit demo / 1024-bit production | 8 / 16 |
-| L (Wesolowski challenge) | 256-bit | 4 |
+| L (Wesolowski challenge) | 251-bit + forced bit 192 | 4 |
 
 Mixing domains breaks the reduction (an infinite normalize loop — the other
 real bug the Python model caught).

@@ -17,13 +17,29 @@ import json
 import secrets
 import sys
 
+from poseidon import poseidon_hash_span
 
-def sha256_int(*values: int) -> int:
-    """Hash integers to a 256-bit challenge L."""
-    h = hashlib.sha256()
-    for v in values:
-        h.update(v.to_bytes((v.bit_length() + 7) // 8 or 1, "big"))
-    return int.from_bytes(h.digest(), "big")
+
+def limbify(value: int, limb_bits: int, n_limbs: int) -> list[int]:
+    """Split an integer into little-endian limbs."""
+    mask = (1 << limb_bits) - 1
+    limbs = []
+    for i in range(n_limbs):
+        limbs.append((value >> (i * limb_bits)) & mask)
+    return limbs
+
+
+def derive_challenge(N: int, x: int, y: int, T: int, n_limbs: int) -> int:
+    """Wesolowski Fiat-Shamir challenge, mirroring Cairo derive_challenge:
+    L = poseidon(N || x || y || T u64 limbs) with bit 192 forced, so
+    2^192 <= L < 2^256 always satisfies the Barrett precondition."""
+    limbs = (
+        limbify(N, 64, n_limbs)
+        + limbify(x, 64, n_limbs)
+        + limbify(y, 64, n_limbs)
+        + limbify(T, 64, 2)
+    )
+    return poseidon_hash_span(limbs) | (1 << 192)
 
 
 def modpow(base: int, exp: int, mod: int) -> int:
@@ -38,30 +54,21 @@ def sequential_square(x: int, T: int, N: int) -> int:
     return y
 
 
-def wesolowski_prove(N: int, T: int, x: int, y: int) -> tuple[int, int]:
+def wesolowski_prove(N: int, T: int, x: int, y: int, n_limbs: int) -> tuple[int, int]:
     """Produce (pi, L) for the Wesolowski proof. Requires knowing q = floor(2^T / L),
     which the honest prover computes by actually performing the T squarings."""
-    L = sha256_int(x, y, T)
+    L = derive_challenge(N, x, y, T, n_limbs)
     # q = floor(2^T / L), r = 2^T mod L
     q, r = divmod(1 << T, L)
     pi = modpow(x, q, N)
     return pi, L, r
 
 
-def wesolowski_verify(N: int, T: int, x: int, y: int, pi: int) -> bool:
-    L = sha256_int(x, y, T)
+def wesolowski_verify(N: int, T: int, x: int, y: int, pi: int, n_limbs: int) -> bool:
+    L = derive_challenge(N, x, y, T, n_limbs)
     r = modpow(2, T, L)  # 2^T mod L — cheap, O(log T)
     lhs = (modpow(pi, L, N) * modpow(x, r, N)) % N
     return lhs == y
-
-
-def limbify(value: int, limb_bits: int, n_limbs: int) -> list[int]:
-    """Split an integer into little-endian limbs."""
-    mask = (1 << limb_bits) - 1
-    limbs = []
-    for i in range(n_limbs):
-        limbs.append((value >> (i * limb_bits)) & mask)
-    return limbs
 
 
 def make_vector(
@@ -116,8 +123,9 @@ def make_vector(
     assert y_fast == y_slow, "RSW shortcut must match sequential squaring"
 
     # Wesolowski proof.
-    pi, L, r = wesolowski_prove(N, T, x, y_fast)
-    assert wesolowski_verify(N, T, x, y_fast, pi), "proof must verify"
+    n_limbs = (n_bits + limb_bits - 1) // limb_bits
+    pi, L, r = wesolowski_prove(N, T, x, y_fast, n_limbs)
+    assert wesolowski_verify(N, T, x, y_fast, pi, n_limbs), "proof must verify"
 
     # RSW timelock: symmetric key from VDF output, AEAD-ish demo.
     msg = b"reveal-opening"
@@ -128,7 +136,6 @@ def make_vector(
     plain = bytes(c ^ key2[i % len(key2)] for i, c in enumerate(ciphertext))
     assert plain == msg
 
-    n_limbs = (n_bits + limb_bits - 1) // limb_bits
     return {
         "name": f"rsa{n_bits}_T{T}",
         "n_bits": n_bits,

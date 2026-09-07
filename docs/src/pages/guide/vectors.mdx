@@ -14,9 +14,12 @@ python3 ref/vdf_reference.py [output.json]
 ```
 
 Writes an array of vectors, each containing: `N`, `x`, `y`, `π`, `L`, `r`
-(as limb arrays), `T`, and the RSA parameters. The reference asserts the RSW
-φ(N) shortcut equals sequential squaring, and that the Wesolowski proof
-verifies, before emitting.
+(as limb arrays), `T`, and the RSA parameters. `L` is the Fiat-Shamir
+challenge `poseidon(N, x, y, T)` with bit 192 forced — the same derivation
+the Cairo verifier performs in-program (`ref/poseidon.py` is cross-checked
+against the Cairo builtin). The reference asserts the RSW φ(N) shortcut
+equals sequential squaring, and that the Wesolowski proof verifies, before
+emitting.
 
 ## Regenerate Cairo tests
 
@@ -24,9 +27,9 @@ verifies, before emitting.
 python3 scripts/regen_clean_tests.py
 ```
 
-Writes `cairo/lib/src/tests.cairo` — two gas-cheap passing tests (both limb
-domains) plus the full-verify test marked `#[ignore]` (exceeds cairo-test's
-2^32 gas cap; run it via `scarb execute` instead).
+Writes `cairo/lib/src/tests.cairo` — unit tests for both limb domains, the
+Barrett boundary regression, mu validation, plus the full-verify and
+forgery-rejection tests (all six fit cairo-test's gas cap post-optimization).
 
 ## Regenerate executable arguments
 
@@ -35,7 +38,9 @@ python3 scripts/write_exec_512.py
 ```
 
 Writes `vectors/exec_args_512.json` — the flat felt252 input array for
-`scarb execute`, with the leading Span-length felt.
+`scarb execute`, with the leading Span-length felt. Layout:
+`[N(8), mu_n(9), x(8), y(8), pi(8), mu_l(5), T(2)]` — the challenge `L` and
+`r` are **not** inputs; they are derived in-program.
 
 ## Validate model changes first
 
@@ -43,6 +48,6 @@ Writes `vectors/exec_args_512.json` — the flat felt252 input array for
 If you change the Cairo math:
 
 1. Change `cairo_model_v2.py` first.
-2. Run it against the vectors: `python3 ref/cairo_model_v2.py vectors/vdf_vectors_512.json`.
+2. Run it against the vectors: `python3 ref/cairo_model_v2.py`.
 3. Diff-test random inputs against the old model before porting.
 4. Port limb-for-limb, then run `scarb execute` on the smallest vector.

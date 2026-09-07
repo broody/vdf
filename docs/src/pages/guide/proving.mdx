@@ -16,8 +16,16 @@ cairo/exec  →  scarb execute --output=standard
             →  target/execute/<pkg>/executionN/prover_input.json
             →  scarb prove --execution-id N
             →  target/execute/<pkg>/executionN/proof/proof.json
-            →  scarb verify <proof.json>
+            →  scarb verify --proof-file <proof.json>
 ```
+
+Verified end-to-end on a 64GB box: the 512-bit execution (14.8M steps, ~660MB
+prover input) proves in ~90s to a ~590MB proof. One caveat: `scarb verify`
+currently panics on this trace shape with `ECDSA segment is not empty` —
+upstream issue
+[`stwo-cairo#1733`](https://github.com/starkware-libs/stwo-cairo/issues/1733)
+(fix pending in PR #1666). The proof artifact itself is valid; verification
+resumes once the pinned stwo-cairo is updated.
 
 ## Onchain verification (the end state)
 
@@ -27,7 +35,7 @@ Cairo, runnable inside the Cairo VM. This enables:
 - **Recursive proving**: a Cairo program that verifies a Stwo Cairo proof can
   itself be proven, yielding a proof tree.
 - **Onchain settlement**: a Starknet tx verifies the small proof instead of
-  executing the ~billion-step computation.
+  executing the ~15M-step (512-bit) / ~46M-step (1024-bit) computation.
 
 ## Gotchas learned the hard way
 
@@ -35,17 +43,20 @@ Cairo, runnable inside the Cairo VM. This enables:
    output is `None` — you get an empty execution dir and no error.
 2. **Arguments file format**: JSON array of **hex strings** (`0x...`), with a
    leading length felt for `Span<felt252>` params (serde reads length first).
-3. **OOM is real**: the prover input for 1024-bit is ~139MB; Stwo needs
-   10-17GB to prove. Use the 512-bit default for CI; prove big sizes on a big
-   machine.
-4. **`scarb prove` invokes the prover with high memory** — on a constrained box
+3. **OOM is real**: Stwo needs ~16GB RAM to prove at these step counts. The
+   512-bit prover input is ~660MB and proves on a 64GB box in ~90s; use the
+   512-bit default for CI and prove big sizes on a big machine.
+4. **`scarb verify` ECDSA-segment panic**: see the note above — upstream
+   stwo-cairo#1733, not a repo bug.
+5. **`scarb prove` invokes the prover with high memory** — on a constrained box
    it dies silently (OOM-kill, exit 137 or empty proof dir). Check `dmesg`.
-5. **Direct binary invocation** of `scarb-execute`/`scarb-prove` needs
+6. **Direct binary invocation** of `scarb-execute`/`scarb-prove` needs
    `SCARB_TARGET_DIR` and `SCARB_PROFILE=dev` exported; the `scarb` shell sets
    them automatically.
 
 ## Performance
 
 - The 512-bit full verification runs as an executable in well under a minute.
-- Proving time depends on machine; the Stwo prover is the current bottleneck
-  (memory, not time, on small boxes).
+- Post-optimization the 512-bit execution is 14.8M steps (~660MB prover
+  input) and proves in ~90s on a 64GB box (was: unprovable on this machine
+  pre-optimization).

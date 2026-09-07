@@ -31,7 +31,8 @@ Options (docs table in `privacy-and-trust.mdx`): bidder reveal (bad UX), thresho
 **RSW timelock + Wesolowski VDF** gives eBay UX with no standing decryptor:
 - Bidder generates RSA modulus N=p·q at bid time, knows φ(N) → derives key instantly via `y = x^(2^T mod φ(N)) mod N`, AEAD-encrypts the opening, discards factors.
 - At deadline ANYONE computes `y = x^(2^T) mod N` (T sequential squarings — the delay), decrypts, and reveals permissionlessly. Even the auctioneer learns bids only at the deadline.
-- Wesolowski proof lets a verifier check the squarings happened in O(log T) group ops: `y == π^L · x^(2^T mod L) (mod N)`, `L = H(x,y,T)`.
+- Wesolowski proof lets a verifier check the squarings happened in O(log T) group ops: `y == π^L · x^(2^T mod L) (mod N)`, with the challenge `L = poseidon(N, x, y, T)` derived **inside the verifier program** (an input L was demonstrated forgeable in this repo — see SKILL.md pitfalls).
+- **Settlement does not need a VDF proof per bid** (added 2026-09): the VDF guarantees the key is *available* to anyone at the deadline; settlement only needs a valid commitment opening. A solver decrypts offchain and submits the opening with a plain `reveal_bid` — the Stwo proof of the VDF verification is only for the permissionless/disputed path.
 
 ## Repo decision (as decided with the user)
 

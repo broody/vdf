@@ -12,12 +12,13 @@ Requires **scarb ≥ 2.20** (ships `scarb execute`, `scarb prove`, `scarb verify
 ```sh
 cd cairo/lib
 scarb test
-# 2 passed, 1 ignored — the full verify exceeds cairo-test's 2^32 gas cap
+# 6 passed — unit checks (both limb domains, Barrett boundary, mu validation)
+# plus the full Wesolowski verify and a forgery-rejection test
 ```
 
-The two passing tests exercise both limb domains: `x^2 mod N` (N domain) and
-`2^T mod L` (L domain). The full Wesolowski check needs more gas than
-cairo-test allows, so it runs via the executable instead:
+The full verification now fits cairo-test's 2^32 gas cap (~1.9B gas after the
+bigint optimization pass), so the positive *and* forged-negative paths run in
+the default test run.
 
 ## 2. Run the full verification as an executable (gas off)
 
@@ -25,11 +26,13 @@ cairo-test allows, so it runs via the executable instead:
 cd ../exec
 python3 ../../scripts/write_exec_512.py   # writes vectors/exec_args_512.json
 scarb execute --arguments-file ../../vectors/exec_args_512.json --print-program-output
-# Program output: 1   <- proof verifies
+# Program output: <instance_hash>   <- poseidon(N, x, y, T); 0 means rejection
 ```
 
-This runs the ~billion-step computation with gas disabled — the same path the
-prover will consume.
+This runs the ~15M-step computation with gas disabled — the same path the
+prover will consume. The output is the instance hash, not a boolean: the
+onchain verifier recomputes `poseidon(N, x, y, T)` from the public instance
+and compares, binding the proof to that exact `(N, x, y, T)`.
 
 ## 3. Prove the execution (big machine)
 
@@ -37,12 +40,14 @@ prover will consume.
 scarb execute --output=standard --arguments-file ../../vectors/exec_args_512.json
 scarb prove --execution-id 1
 # -> target/execute/vdf_exec/execution1/proof/proof.json
-scarb verify target/execute/vdf_exec/execution1/proof/proof.json
+scarb verify --proof-file target/execute/vdf_exec/execution1/proof/proof.json
 ```
 
-> **Memory**: the 512-bit prover input is ~140MB and Stwo needs ~10-17GB RAM to
-> prove it. The 1024-bit trace is ~4x heavier. Use a 16GB+ machine; the
-> execution artifacts are portable — copy the execution dir and prove there.
+> **Memory**: Stwo needs ~16GB RAM to prove at these step counts (~15M for the
+> 512-bit demo, ~46M for 1024-bit). The 512-bit pipeline was verified
+> end-to-end on a 64GB box (prove in ~90s). `scarb verify` currently panics
+> with an ECDSA-segment assertion — upstream
+> [stwo-cairo#1733](https://github.com/starkware-libs/stwo-cairo/issues/1733).
 
 ## Modulus sizes
 
