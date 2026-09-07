@@ -17,25 +17,28 @@
 /// committee, and no TEE.
 ///
 /// Big-int representation: little-endian limbs of 64 bits. Two limb domains:
-///   N (1024-bit modulus)       -> N_LIMBS = 16
+///   N (512-bit demo modulus)   -> N_LIMBS = 8 (32 for 2048-bit)
 ///   L (256-bit challenge)      -> L_LIMBS = 4
 /// Barrett reduction uses mu = floor(b^(2k)/N) with k+1 limbs, computed
 /// offchain and passed in (validated in-program, see verify_vdf).
 ///
-/// Cairo constraints honored: limbs are u64 (supports shift/compare/bitand),
-/// multiplication columns accumulate in a u128 (hi, lo) pair — each product of
-/// two u64s fits u128, column overflow counts into hi, and the 64-bit carry
-/// chain is exact (ref/cairo_model_v2.py mirrors this at limb level).
+/// Limbs are u64; multiplication columns accumulate exactly in felt252 and
+/// split once into u128 halves for the carry chain. ref/cairo_model_v2.py
+/// mirrors the limb arithmetic and joint exponentiation.
 
 pub const LIMB_BITS: u32 = 64;
-pub const N_LIMBS: usize = 8; // 512-bit RSA modulus (demo/CI); 16 for 1024-bit production
+pub const N_LIMBS: usize = 8; // 512-bit RSA modulus (demo/CI); 32 for 2048-bit production
 pub const L_LIMBS: usize = 4;
 
 const TWO64: u128 = 0x10000000000000000;
 const MASK64: u128 = 0xffffffffffffffff;
 
 /// Schoolbook column multiplication: one output limb at a time with a chained
-/// carry, accumulating each column in a (hi, lo) u128 pair instead of u256.
+/// carry, accumulating each column in felt252 and splitting once into u128 halves.
+/// With n = min(an, bn), carry < n*2^64 and acc < n*2^128 by induction:
+/// n*(2^64-1)^2 + n*2^64 < n*2^128. Since usize is u32, acc < 2^160,
+/// below the Cairo field modulus, and the next carry fits u128. For the
+/// 2048-bit configuration n <= 33, giving the tighter bound acc < 2^134.
 /// Only contributing pairs are visited: i in [max(0, t+1-bn), min(an-1, t)].
 /// The product is truncated to the low `out_limbs` columns (the carry out of
 /// the last kept column is dropped), which is exact for callers that only
@@ -51,10 +54,8 @@ pub fn bigint_mul(
     let mut carry: u128 = 0;
     let mut t: usize = 0;
     while t < total {
-        // column acc = carry_in + sum_{i+j==t} a[i]*b[j], tracked as (hi, lo):
-        // lo accumulates mod 2^128, hi counts the overflows (<= an products).
-        let mut lo: u128 = carry;
-        let mut hi: u128 = 0;
+        // The bound above makes felt addition and multiplication exact integers.
+        let mut acc: felt252 = carry.into();
         let mut i: usize = if t + 1 > bn {
             t + 1 - bn
         } else {
@@ -66,15 +67,14 @@ pub fn bigint_mul(
             an - 1
         };
         while i <= hi_i {
-            let ai: u128 = (*a.at(i)).into();
-            let bj: u128 = (*b.at(t - i)).into();
-            let (sum, overflow) = core::num::traits::OverflowingAdd::overflowing_add(lo, ai * bj);
-            lo = sum;
-            if overflow {
-                hi += 1;
-            }
+            let ai: felt252 = (*a.at(i)).into();
+            let bj: felt252 = (*b.at(t - i)).into();
+            acc = acc + ai * bj;
             i += 1;
         }
+        let split: u256 = acc.into();
+        let lo = split.low;
+        let hi = split.high;
         let limb: u64 = (lo & MASK64).try_into().unwrap();
         out.append(limb);
         carry = hi * TWO64 + lo / TWO64;
@@ -96,7 +96,7 @@ pub fn ge_limbs(a: Span<u64>, b: Span<u64>, k: usize) -> bool {
         if ai != bi {
             return ai > bi;
         }
-    };
+    }
     true // equal
 }
 
@@ -129,35 +129,20 @@ pub fn sub_limbs(a: Span<u64>, b: Span<u64>, k: usize) -> Array<u64> {
 /// normalization. (Keeping only k limbs wraps whenever p - q3*N >= b^k and
 /// returns a wrong residue — e.g. N = 2^512-1, a = 2^448-1, b = 2^448+1 is
 /// off by one. See scripts/repro_issues.py.)
-pub fn barrett_reduce(
-    p: Span<u64>, N: Span<u64>, mu: Span<u64>, k: usize,
-) -> Array<u64> {
+pub fn barrett_reduce(p: Span<u64>, N: Span<u64>, mu: Span<u64>, k: usize) -> Array<u64> {
     // q1 = p >> (k-1)   (k+1 limbs)
-    let mut q1 = ArrayTrait::new();
-    let mut i: usize = k - 1;
-    while i < 2 * k {
-        q1.append(*p.at(i));
-        i += 1;
-    }
-
-    // q2 = q1 * mu      (2k+2 limbs)
-    let q2 = bigint_mul(q1.span(), mu, k + 1, k + 1, 2 * (k + 1));
-
-    // q3 = q2 >> (k+1)  (k+1 limbs)
-    let mut q3 = ArrayTrait::new();
-    i = k + 1;
-    while i < 2 * k + 2 {
-        q3.append(*q2.at(i));
-        i += 1;
-    }
+    let q1 = p.slice(k - 1, k + 1);
+    // q2 = q1 * mu; retain all columns because low carries feed the high half.
+    let q2 = bigint_mul(q1, mu, k + 1, k + 1, 2 * (k + 1));
+    let q3 = q2.span().slice(k + 1, k + 1); // q2 >> (k+1)
 
     // q3n = low k+1 limbs of q3 * N (only columns 0..k feed r)
-    let q3n = bigint_mul(q3.span(), N, k + 1, k, k + 1);
+    let q3n = bigint_mul(q3, N, k + 1, k, k + 1);
 
     // r = (p - q3n) mod b^(k+1) with borrow — exact, no truncation
     let mut r = ArrayTrait::new();
     let mut borrow: u64 = 0;
-    i = 0;
+    let mut i: usize = 0;
     while i < k + 1 {
         let minuend: u128 = (*p.at(i)).into();
         let subtrahend: u128 = (*q3n.at(i)).into() + borrow.into();
@@ -196,9 +181,7 @@ pub fn barrett_reduce(
 }
 
 /// Modular multiplication: a*b mod N. a, b < N < b^k.
-pub fn modmul(
-    a: Span<u64>, b: Span<u64>, N: Span<u64>, mu: Span<u64>, k: usize,
-) -> Array<u64> {
+pub fn modmul(a: Span<u64>, b: Span<u64>, N: Span<u64>, mu: Span<u64>, k: usize) -> Array<u64> {
     let p = bigint_mul(a, b, k, k, 2 * k);
     barrett_reduce(p.span(), N, mu, k)
 }
@@ -207,12 +190,7 @@ pub fn modmul(
 /// of the (exp_n-limb) exponent. Trailing zero limbs/bits are skipped and the
 /// squaring after the top set bit is omitted.
 pub fn modpow(
-    base: Span<u64>,
-    exp: Span<u64>,
-    exp_n: usize,
-    N: Span<u64>,
-    mu: Span<u64>,
-    k: usize,
+    base: Span<u64>, exp: Span<u64>, exp_n: usize, N: Span<u64>, mu: Span<u64>, k: usize,
 ) -> Array<u64> {
     // one = 1 in the k-limb domain
     let mut one = ArrayTrait::new();
@@ -322,9 +300,7 @@ pub fn mu_valid(m: Span<u64>, mu: Span<u64>, k: usize) -> bool {
 /// Hash of the VDF instance: poseidon(N || x || y || T limbs as felt252s).
 /// Seeds the Fiat-Shamir challenge and is returned by the executable as the
 /// public, instance-binding output.
-pub fn instance_hash(
-    N: Span<u64>, x: Span<u64>, y: Span<u64>, T_limbs: Span<u64>,
-) -> felt252 {
+pub fn instance_hash(N: Span<u64>, x: Span<u64>, y: Span<u64>, T_limbs: Span<u64>) -> felt252 {
     let mut input = ArrayTrait::new();
     let mut i: usize = 0;
     while i < N.len() {
@@ -402,12 +378,65 @@ pub fn verify_vdf(
     let r = modpow(two.span(), T_limbs, T_n, L.span(), mu_l, L_LIMBS);
 
     // 2. lhs = pi^L * x^r mod N
-    let pi_l = modpow(pi, L.span(), L_LIMBS, N, mu_n, N_LIMBS);
-    let x_r = modpow(x, r.span(), L_LIMBS, N, mu_n, N_LIMBS);
-    let lhs = modmul(pi_l.span(), x_r.span(), N, mu_n, N_LIMBS);
+    let lhs = joint_modpow(pi, L.span(), x, r.span(), N, mu_n, N_LIMBS);
 
     // 3. check lhs == y
     limbs_eq(lhs.span(), y, N_LIMBS)
 }
+
+/// a^e * b^f mod N for two L_LIMBS-limb exponents, sharing each squaring.
+/// Inputs may be noncanonical k-limb bases; reduce them before precomputation.
+/// Both zero exponents return one, matching modpow for the supported moduli.
+fn joint_modpow(
+    a: Span<u64>, e: Span<u64>, b: Span<u64>, f: Span<u64>, N: Span<u64>, mu: Span<u64>, k: usize,
+) -> Array<u64> {
+    let mut one = array![1_u64];
+    let mut i = 1;
+    while i < k {
+        one.append(0);
+        i += 1;
+    }
+    let ar = modmul(a, one.span(), N, mu, k);
+    let br = modmul(b, one.span(), N, mu, k);
+    let ab = modmul(ar.span(), br.span(), N, mu, k);
+    let mut result = one;
+    // Skip leading zero pairs and copy the first factor instead of multiplying one.
+    let mut started = false;
+    i = L_LIMBS;
+    while i != 0 {
+        i -= 1;
+        let ei = *e.at(i);
+        let fi = *f.at(i);
+        let mut mask: u64 = 0x8000000000000000;
+        while mask != 0 {
+            let eb = (ei / mask) % 2 != 0;
+            let fb = (fi / mask) % 2 != 0;
+            if started {
+                result = modmul(result.span(), result.span(), N, mu, k);
+            }
+            if eb || fb {
+                let factor = if eb {
+                    if fb {
+                        ab.span()
+                    } else {
+                        ar.span()
+                    }
+                } else {
+                    br.span()
+                };
+                if started {
+                    result = modmul(result.span(), factor, N, mu, k);
+                } else {
+                    result = factor.into();
+                    started = true;
+                }
+            }
+            mask /= 2;
+        }
+    }
+    result
+}
+#[cfg(test)]
+mod arithmetic_tests;
 
 mod tests;

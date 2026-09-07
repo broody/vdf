@@ -31,7 +31,7 @@ x^(2^T) = x^(q·L + r) = (x^q)^L · x^r = π^L · x^r   (mod N)
 ```text
 L = poseidon(N, x, y, T)          ← derived in-program
 r = 2^T mod L                     ← cheap: pow(2, T, L)
-check  π^L · x^r == y  (mod N)    ← two modpows, ~256-bit exponents
+check  π^L · x^r == y  (mod N)    ← joint exponentiation, ~256-bit exponents
 ```
 
 The verifier never performs the T squarings. It checks a statement about them

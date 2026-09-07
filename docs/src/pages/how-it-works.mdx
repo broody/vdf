@@ -43,8 +43,8 @@ description: The RSW timelock + Wesolowski proof flow, end to end.
    y == π^L · x^r  (mod N)
    ```
 
-   Only two modular exponentiations with ~256-bit exponents are needed —
-   milliseconds, not T squarings. The challenge `L` is derived inside the
+   Joint exponentiation shares the squarings across the two ~256-bit
+   exponents. The challenge `L` is derived inside the
    verifier itself (in-program, from the instance) so the prover cannot pick
    a favorable one — see *Concepts → Wesolowski VDF*.
 

@@ -1,6 +1,6 @@
 ---
 title: Cairo bigint
-description: Why Cairo needs u64/u128 limb arithmetic instead of felt252, and the Barrett reduction pattern used here.
+description: u64 limbs, bounded felt accumulation, joint exponentiation and validated Barrett reduction.
 ---
 
 # Cairo bigint
@@ -12,18 +12,25 @@ arithmetic on it directly. This repo uses a validated pattern:
 ## Representation
 
 - **Limbs**: `u64`, little-endian.
-- **Multiplication**: schoolbook columns, each accumulated in a `(hi, lo)`
-  u128 pair — `u64×u64→u128` products are native, column overflows count into
-  `hi` via `u128_overflowing_add`. Only contributing `(i, j)` pairs are
-  visited, and products are truncated to the low columns the caller actually
-  reads (Barrett's `q3·N`). This cut the 512-bit verify from 40.0M to ~14.8M
-  Cairo steps versus generic `u256` accumulation.
-- **Carry**: `lo & 0xffffffffffffffff` → limb, `hi·2^64 + lo/2^64` → carry
+- **Multiplication**: schoolbook columns accumulated in `felt252`, then split
+  once into a u256's two u128 halves. For n contributing u64 products, the
+  carry is below `n*2^64` and the column including carry is below `n*2^128`.
+  Since Cairo's usize is u32, even the generic function stays below `2^160`,
+  well below the field modulus; the next carry also fits u128. For the
+  2048-bit configuration n is at most 33, so the tighter bound is `2^134`.
+  Retain these bounds when changing limb widths. Only contributing pairs
+  are visited; products are truncated only where the caller needs low limbs.
+- **Carry**: after the split, `lo & 0xffffffffffffffff` → limb, `hi·2^64 + lo/2^64` → carry
   (constant-divisor division on u128 is integer division).
 - **Subtraction with borrow**: compute in `u128`; the borrow applies to the
   **subtrahend**, not the minuend (a real bug caught by the Python model).
 - **Bit scan in modpow**: `e % 2` / `e / 2` loop on u64 (not shifts);
-  trailing zero limbs/bits of the exponent are skipped.
+  leading zero limbs/bits of the exponent are skipped.
+- **Joint exponentiation**: `pi^L*x^r` scans both four-limb exponents from
+  most significant bit to least significant bit, sharing each squaring. Reduce
+  both bases, precompute `pi*x`, then choose the factor from `1`, pi, x, pi*x.
+  Both zero exponents return one; the first nonzero factor is copied directly.
+  The separate modpow remains for `2^T mod L`.
 
 ## Barrett reduction (HAC 14.42)
 
@@ -48,13 +55,27 @@ moduli — but in the RSW setting **N is chosen by the bidder**, so the
 primitive must be correct for every modulus. Regression test:
 `barrett_boundary_top_limb_all_ones`; sweeps: `scripts/hunt_barrett.py`.
 
+q1 and q3 are span slices rather than array copies. The full q1*mu product
+still computes its low columns: their carry contributes to the retained high
+half. The k+1-limb normalization and both mu validations are unchanged.
+
+## Measured execution cost
+
+With Scarb/Cairo 2.18.0, dev profile, `stwo_no_ecop`, T=65536, joint
+exponentiation, felt accumulation and span slices reduce the checked-in
+512-bit vector from 14,838,481 to 5,629,093 steps (62.1%). The checked-in
+2048-bit vector falls from 155,970,789 to 49,429,902 steps (68.3%). At 512
+bits the independent savings are 41.3%, 33.2% and 2.3%; they are not additive.
+These are execution-resource measurements; optimized proof generation and
+onchain transaction gas have not been measured.
+
 ## Per-modulus limb domains
 
 Each modulus gets its own limb count and Barrett constant:
 
 | Modulus | Size | Limbs |
 |---|---|---|
-| N (RSA modulus) | 512-bit demo / 1024-bit production | 8 / 16 |
+| N (RSA modulus) | 512-bit demo / 2048-bit production | 8 / 32 |
 | L (Wesolowski challenge) | 251-bit + forced bit 192 | 4 |
 
 Mixing domains breaks the reduction (an infinite normalize loop — the other

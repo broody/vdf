@@ -28,7 +28,7 @@ provides the cryptographic primitive:
 
 ```
 cairo/
-  lib/   # bigint + Wesolowski verifier (u64 limbs, u128 column accumulation, Barrett)
+  lib/   # bigint + Wesolowski verifier (u64 limbs, bounded felt column accumulation, Barrett)
   exec/  # #[executable] vdf_verify entrypoint, depends on lib
 ref/     # Python reference + exact Cairo-algorithm model + Poseidon (cross-checked with Cairo)
 vectors/ # test vectors (RSW keys + Wesolowski proofs)
@@ -65,7 +65,7 @@ Requires scarb ≥ 2.20 (ships `scarb execute` / `scarb prove` / `scarb verify`)
 ```sh
 # 1. Validate the bigint math and the security properties
 cd cairo/lib
-scarb test                      # 6 passed: unit checks + full verify + forgery rejection
+scarb test                      # 37 passed: arithmetic + full verify + forgery rejection
 
 # 2. Run the full Wesolowski verification as an executable (gas off)
 cd ../exec
@@ -73,7 +73,7 @@ python3 ../../scripts/write_exec_512.py   # writes vectors/exec_args_512.json
 scarb execute --arguments-file ../../vectors/exec_args_512.json --print-program-output
 # Program output: <instance_hash>   <- poseidon(N, x, y, T); 0 would mean rejection
 
-# 3. Prove the execution with Stwo (works on a 16GB+ machine; 512-bit verified here)
+# 3. Generate and verify a Stwo proof (optimized trace not yet benchmarked)
 scarb execute --output=standard --arguments-file ../../vectors/exec_args_512.json
 scarb prove --execution-id 1   # -> target/execute/vdf_exec/execution1/proof/proof.json
 scarb verify --proof-file target/execute/vdf_exec/execution1/proof/proof.json
@@ -83,19 +83,30 @@ On success the executable outputs `poseidon(N, x, y, T)` (a nonzero felt252),
 not a boolean: the onchain verifier recomputes that hash from the public
 instance, which binds the Stwo proof to the exact `(N, x, y, T)` it claims.
 
-Measured execution (scarb 2.18, `--print-resource-usage`): **~14.8M Cairo
-steps** for the 512-bit demo, **~45.7M** for the 1024-bit production config
-(down from ~40M and ~160M before the bigint optimization pass — see
-*Cairo bigint* below).
+Measured execution (Scarb/Cairo 2.18.0, dev profile, `stwo_no_ecop`,
+`--output=none --print-resource-usage`, T=65536):
 
-Proving was verified end-to-end on a 64GB box: the 512-bit execution (14.8M
-steps, ~660MB prover input) proves in ~90s to a ~590MB proof. One caveat:
-`scarb verify` currently panics on this trace shape with `ECDSA segment is
-not empty` — upstream issue
-[`stwo-cairo#1733`](https://github.com/starkware-libs/stwo-cairo/issues/1733)
-(fix pending in PR #1666). The proof artifact itself is valid; verification
-resumes once the pinned stwo-cairo is updated. For production use a 2048-bit
-modulus (`N_LIMBS = 32`) and a serious proving machine.
+| Modulus | Before | Optimized | Step reduction |
+|---|---:|---:|---:|
+| 512-bit demo | 14,838,481 | 5,629,093 | 62.1% |
+| 2048-bit | 155,970,789 | 49,429,902 | 68.3% |
+
+Joint exponentiation, bounded felt accumulation and Barrett span slices preserve
+both instance hashes. These are offchain execution measurements, not transaction
+fees or measured proving-time savings. The 512-bit full-verification test's gas
+estimate is ~0.72B, down from ~1.92B.
+
+To reproduce the 2048-bit execution, set `N_LIMBS = 32` and run the executable
+with `--arguments-file ../../vectors/exec_args_2048.json`. Restore `N_LIMBS = 8`
+for the default full-verification tests. Both benchmark vectors are checked in.
+
+A **historical** 512-bit run, before these optimizations (14.8M steps), generated
+~660MB of prover input and a ~590MB proof in ~90s on a 64GB box. That run hit
+`ECDSA segment is not empty` during `scarb verify`, recorded in
+[`stwo-cairo#1733`](https://github.com/starkware-libs/stwo-cairo/issues/1733).
+The optimized traces have been executed and tested, but have not yet been
+proven or proof-verified; the historical proving figures do not describe them.
+For production use a 2048-bit modulus (`N_LIMBS = 32`).
 
 ## How it works
 
@@ -104,12 +115,16 @@ modulus (`N_LIMBS = 32`) and a serious proving machine.
 Cairo `felt252` lacks `PartialOrd`, `Rem`, and shifts, and `/` is field
 division — so bigint math uses:
 
-- **u64 limbs** (little-endian), **u128 column accumulation** for
-  multiplication: each column sums its `u64×u64→u128` products in a
-  `(hi, lo)` u128 pair (`u128_overflowing_add`), then folds into a 64-bit
-  limb + carry. Visiting only contributing `(i, j)` pairs and truncating
-  products whose high limbs are never read cut execution ~63% (40.0M → 14.8M
-  steps for the 512-bit verify).
+- **u64 limbs** (little-endian), **bounded felt column accumulation**:
+  products are accumulated exactly in `felt252`, then split once per column
+  into u128 halves for limb extraction and carry. With at most 33 products
+  per column at 2048 bits, the sum including carry is below `2^134`, far below
+  the field modulus. Integer division and borrow arithmetic remain in u128.
+- **Joint exponentiation**: scan the bits of L and r together, sharing
+  squarings and selecting a factor from `1`, pi, x or precomputed `pi*x`.
+  Bases are reduced before precomputation, including noncanonical inputs.
+- **Span slices** for Barrett's q1 and q3 avoid per-reduction array copies;
+  q2 still computes all columns because low carries affect its high half.
 - **u128 subtraction with borrow** (borrow applies to the subtrahend)
 - **Barrett reduction** with `mu = floor(b^(2k)/N)` computed offchain (k+1
   limbs) and **validated in-program** (`mu·m ≤ b^2k < (mu+1)·m`)
@@ -145,7 +160,8 @@ mixed limb domains).
 
 The `exec/` package is a Cairo *program*; its execution is proven with Stwo and
 verified with the Cairo recursive verifier (stwo-cairo ships one) — so a Starknet
-tx never runs the ~46M-step (1024-bit) computation, it just verifies a small proof.
+tx would verify a proof of the ~49.4M-step (2048-bit) computation. This onchain
+integration is still pending.
 
 ## Status
 
@@ -153,10 +169,10 @@ tx never runs the ~46M-step (1024-bit) computation, it just verifies a small pro
 - [x] Cairo verifier (`lib`) + `#[executable]` entrypoint (`exec`)
 - [x] In-program Fiat-Shamir challenge + Barrett constant validation (soundness)
 - [x] Barrett k+1-limb normalization (HAC 14.42) + boundary regression tests
-- [x] `scarb execute` → instance hash on 512/1024-bit vectors (14.8M / 45.7M steps)
-- [x] `scarb execute --output=standard` → prover input
-- [x] `scarb prove` (512-bit verified end-to-end; ~90s / 590MB proof on a 64GB box)
-- [ ] `scarb verify` (blocked: upstream stwo-cairo#1733 ECDSA-segment panic; proof artifact is valid)
+- [x] `scarb execute` → instance hash on 512/2048-bit vectors (5.63M / 49.43M steps)
+- [x] Historical `scarb execute --output=standard` → prover input
+- [x] Historical `scarb prove` (512-bit, before latest optimizations; ~90s / 590MB)
+- [ ] Prove and verify the optimized traces (historical verification hit stwo-cairo#1733)
 - [ ] Onchain recursive-verifier integration
 
 ## References

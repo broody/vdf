@@ -12,11 +12,11 @@ Requires **scarb ≥ 2.20** (ships `scarb execute`, `scarb prove`, `scarb verify
 ```sh
 cd cairo/lib
 scarb test
-# 6 passed — unit checks (both limb domains, Barrett boundary, mu validation)
-# plus the full Wesolowski verify and a forgery-rejection test
+# 37 passed — arithmetic at 256/512/1024/2048 bits, Barrett and mu checks,
+# joint-exponentiation edges, full Wesolowski verification and forgery rejection
 ```
 
-The full verification now fits cairo-test's 2^32 gas cap (~1.9B gas after the
+The full verification now fits cairo-test's 2^32 gas cap (~0.72B gas after the
 bigint optimization pass), so the positive *and* forged-negative paths run in
 the default test run.
 
@@ -29,7 +29,7 @@ scarb execute --arguments-file ../../vectors/exec_args_512.json --print-program-
 # Program output: <instance_hash>   <- poseidon(N, x, y, T); 0 means rejection
 ```
 
-This runs the ~15M-step computation with gas disabled — the same path the
+This runs the ~5.63M-step computation with gas disabled — the same path the
 prover will consume. The output is the instance hash, not a boolean: the
 onchain verifier recomputes `poseidon(N, x, y, T)` from the public instance
 and compares, binding the proof to that exact `(N, x, y, T)`.
@@ -43,11 +43,11 @@ scarb prove --execution-id 1
 scarb verify --proof-file target/execute/vdf_exec/execution1/proof/proof.json
 ```
 
-> **Memory**: Stwo needs ~16GB RAM to prove at these step counts (~15M for the
-> 512-bit demo, ~46M for 1024-bit). The 512-bit pipeline was verified
-> end-to-end on a 64GB box (prove in ~90s). `scarb verify` currently panics
-> with an ECDSA-segment assertion — upstream
-> [stwo-cairo#1733](https://github.com/starkware-libs/stwo-cairo/issues/1733).
+> **Proving measurements**: the historical 14.8M-step 512-bit program generated
+> a proof in ~90s on a 64GB box; verification then hit an ECDSA-segment assertion
+> ([stwo-cairo#1733](https://github.com/starkware-libs/stwo-cairo/issues/1733)).
+> The optimized 5.63M-step trace has been executed and tested, but proving
+> time, memory use and proof verification have not yet been measured.
 
 ## Modulus sizes
 
@@ -56,5 +56,5 @@ scarb verify --proof-file target/execute/vdf_exec/execution1/proof/proof.json
 | N_LIMBS | Modulus | Use |
 |---|---|---|
 | 8 | 512-bit | demo / CI / small boxes |
-| 16 | 1024-bit | production baseline |
+| 16 | 1024-bit | intermediate benchmark |
 | 32 | 2048-bit | production, serious proving machine |

@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Model v2: Cairo-ready bigint with u64 limbs + u256 accumulation.
+"""Cairo bigint model: u64 limbs, bounded felt columns and joint exponentiation.
 
-Mirrors the rewrite that avoids felt252 ops Cairo 2.13 does not support
-(no PartialOrd, no Rem/Div, no shifts on felt252). All arithmetic lives in
-u64 (limbs) and u256 (accumulation/carry/subtraction), which Cairo supports
-natively. Validated against the same Wesolowski vectors.
+Python integers model each exact column sum; assertions check the Cairo field
+and carry bounds before splitting into the same u128 halves as the Cairo code.
 """
 
 import json
@@ -12,6 +10,7 @@ import json
 LIMB_BITS = 64
 MASK = (1 << LIMB_BITS) - 1
 TWO64 = 1 << LIMB_BITS
+FELT_PRIME = (1 << 251) + 17 * (1 << 192) + 1
 
 
 def to_limbs(v: int, n: int) -> list[int]:
@@ -36,7 +35,8 @@ def bigint_mul(a: list[int], b: list[int], an: int, bn: int,
     `out_limbs` truncates the product to the low `out_limbs` columns (mod b^out_limbs);
     the carry out of the last kept column is dropped, which is exact for callers that
     only consume low limbs (Barrett's q3n). The Cairo version mirrors this loop shape
-    and accumulates each column in a u128 (hi, lo) pair instead of u256 — same math.
+    and accumulates each column as a felt, splitting once into u128 halves.
+    With at most n u64 products, acc < n*2^128 and carry < n*2^64.
     """
     total = an + bn if out_limbs is None else min(an + bn, out_limbs)
     out = []
@@ -47,13 +47,17 @@ def bigint_mul(a: list[int], b: list[int], an: int, bn: int,
         hi_i = min(an - 1, t)
         for i in range(lo_i, hi_i + 1):
             acc += a[i] * b[t - i]
-        out.append(acc & MASK)
-        carry = acc >> LIMB_BITS
+        assert acc < FELT_PRIME, "column must not wrap in the Cairo field"
+        lo = acc & ((1 << 128) - 1)
+        hi = acc >> 128
+        out.append(lo & MASK)
+        carry = hi * TWO64 + lo // TWO64
+        assert carry < 1 << 128
     return out
 
 
 def sub_limbs(a: list[int], b: list[int], k: int) -> list[int]:
-    """Limb-wise a - b with borrow, u256-style minuend/subtrahend check."""
+    """Limb-wise a - b with borrow, matching the Cairo u128 arithmetic."""
     out = []
     borrow = 0
     for i in range(k):
@@ -85,9 +89,9 @@ def barrett_reduce(p: list[int], N: list[int], mu: list[int], k: int) -> list[in
     residue wrapped mod b^k and the two conditional subtractions returned a
     wrong result — e.g. N = 2^512-1, a = 2^448-1, b = 2^448+1 was off by one.)
     """
-    q1 = p[k - 1:]  # k+1 limbs
+    q1 = p[k - 1:2 * k]  # Cairo takes a span without copying
     q2 = bigint_mul(q1, mu, k + 1, k + 1)  # 2k+2 limbs
-    q3 = q2[k + 1:]  # k+1 limbs
+    q3 = q2[k + 1:2 * k + 2]  # another k+1-limb span
     q3n = bigint_mul(q3, N, k + 1, k, out_limbs=k + 1)  # low k+1 limbs only
 
     # r = (p - q3n) mod b^(k+1) with borrow (exact: 0 <= p - q3n < b^(k+1))
@@ -117,14 +121,43 @@ def modmul(a: list[int], b: list[int], N: list[int], mu: list[int], k: int) -> l
 
 def modpow(base: list[int], exp: list[int], exp_n: int, N: list[int], mu: list[int], k: int) -> list[int]:
     one = [1] + [0] * (k - 1)
-    result = barrett_reduce(bigint_mul(one, one, k, k), N, mu, k)
+    result = one.copy()
     base_red = modmul(base, one, N, mu, k)
-    for i in range(exp_n):
+    top = exp_n
+    while top and exp[top - 1] == 0:
+        top -= 1
+    for i in range(top):
         e = exp[i]
-        for bit in range(LIMB_BITS):
-            if (e >> bit) & 1:
+        limit = exp[top - 1].bit_length() if i == top - 1 else LIMB_BITS
+        for bit in range(limit):
+            if e % 2:
                 result = modmul(result, base_red, N, mu, k)
-            base_red = modmul(base_red, base_red, N, mu, k)
+            e //= 2
+            if not (i == top - 1 and bit + 1 == limit):
+                base_red = modmul(base_red, base_red, N, mu, k)
+    return result
+
+
+def joint_modpow(a: list[int], e: list[int], b: list[int], f: list[int],
+                 N: list[int], mu: list[int], k: int) -> list[int]:
+    """a^e*b^f mod N, sharing squarings across two four-limb exponents."""
+    one = [1] + [0] * (k - 1)
+    ar = modmul(a, one, N, mu, k)
+    br = modmul(b, one, N, mu, k)
+    ab = modmul(ar, br, N, mu, k)
+    result = one
+    started = False
+    for i in range(3, -1, -1):
+        mask = 1 << 63
+        while mask:
+            eb, fb = (e[i] // mask) % 2, (f[i] // mask) % 2
+            if started:
+                result = modmul(result, result, N, mu, k)
+            if eb or fb:
+                factor = (ab if fb else ar) if eb else br
+                result = modmul(result, factor, N, mu, k) if started else factor.copy()
+                started = True
+            mask //= 2
     return result
 
 
@@ -168,9 +201,7 @@ def verify_vector(v: dict) -> bool:
     r_calc = modpow(to_limbs(2, kL), to_limbs(T, 2), 2, L, muL, kL)
     assert from_limbs(r_calc) == int(v["r"], 16), f"r mismatch: {from_limbs(r_calc):x}"
 
-    piL = modpow(pi, L, kL, N, muN, kN)
-    xr = modpow(x, r_calc, kL, N, muN, kN)
-    lhs = modmul(piL, xr, N, muN, kN)
+    lhs = joint_modpow(pi, L, x, r_calc, N, muN, kN)
     return from_limbs(lhs) == int(v["y"], 16)
 
 

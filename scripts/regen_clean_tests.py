@@ -132,7 +132,7 @@ out.append("        assert(!verify_vdf(N, mu_n, x, y_fake, pi_fake, mu_l, T_limb
 out.append("    }")
 out.append("")
 out.append("    // Full Wesolowski check — post-optimization it fits cairo-test's")
-out.append("    // 2^32 gas cap (~1.9B gas), so it runs in the default test run.")
+out.append("    // 2^32 gas cap (~0.72B gas), so it runs in the default test run.")
 out.append("    #[test]")
 out.append("    fn full_wesolowski_verifies() {")
 out.append(f"        let N = {arr(v['N_limbs'])};")

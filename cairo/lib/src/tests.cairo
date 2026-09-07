@@ -90,7 +90,7 @@ mod tests {
     }
 
     // Full Wesolowski check — post-optimization it fits cairo-test's
-    // 2^32 gas cap (~1.9B gas), so it runs in the default test run.
+    // 2^32 gas cap (~0.72B gas), so it runs in the default test run.
     #[test]
     fn full_wesolowski_verifies() {
         let N = array![5135600859310664923, 11520123331373703671, 12696800888177789570, 14289338622341901805, 16749385228720951234, 7503658199550084444, 13926480577912486189, 10906071976544146032].span();

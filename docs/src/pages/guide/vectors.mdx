@@ -25,11 +25,15 @@ emitting.
 
 ```sh
 python3 scripts/regen_clean_tests.py
+python3 scripts/gen_arithmetic_tests.py
 ```
 
 Writes `cairo/lib/src/tests.cairo` — unit tests for both limb domains, the
 Barrett boundary regression, mu validation, plus the full-verify and
-forgery-rejection tests (all six fit cairo-test's gas cap post-optimization).
+forgery-rejection tests (six tests). `gen_arithmetic_tests.py` writes 31
+additional tests to `arithmetic_tests.cairo`, using Python integer arithmetic
+as the oracle and seed 20260907. These cover full and noncanonical operands
+at 256–2048 bits and zero, sparse, dense and random exponent pairs.
 
 ## Regenerate executable arguments
 
@@ -49,5 +53,6 @@ If you change the Cairo math:
 
 1. Change `cairo_model_v2.py` first.
 2. Run it against the vectors: `python3 ref/cairo_model_v2.py`.
-3. Diff-test random inputs against the old model before porting.
+3. Run differential tests against Python integers:
+   `python3 -m unittest discover -s ref -p 'test_*.py' -v`.
 4. Port limb-for-limb, then run `scarb execute` on the smallest vector.
