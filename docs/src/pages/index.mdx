@@ -38,7 +38,7 @@ flowchart LR
   force-reveal at the deadline.
 - **Provable**: the reveal computation can be proven with Stwo and verified
   onchain via the Cairo recursive verifier — a Starknet tx never runs the
-  ~49.4M-step (2048-bit) computation, it verifies a small proof.
+  ~53.9M-step (2048-bit) computation, it verifies a small proof.
 
 ## Repository layout
 
@@ -57,8 +57,10 @@ skill/   # the Hermes skill for this work (SKILL.md + references + scripts)
 - [x] Python reference + vectors (RSW + Wesolowski)
 - [x] Cairo verifier (`lib`) + `#[executable]` entrypoint (`exec`)
 - [x] In-program Fiat-Shamir challenge + Barrett constant validation (soundness)
+- [x] Hash-to-prime challenge (20 Miller–Rabin rounds) + signed group `Z_N^*/{±1}`
+- [x] In-program RSW decryption (Poseidon keystream) + commitment output
 - [x] Barrett k+1-limb normalization (HAC 14.42) + boundary regression tests
-- [x] `scarb execute` → instance hash on 512/2048-bit vectors (5.63M / 49.43M steps)
+- [x] `scarb execute` → 4-felt output on 512/2048-bit vectors (8.49M / 53.90M steps)
 - [x] Historical `scarb execute --output=standard` → prover input
 - [x] Historical `scarb prove` (512-bit, before latest optimizations; ~90s / 590MB)
 - [ ] Prove and verify the optimized traces (historical verification hit stwo-cairo#1733)

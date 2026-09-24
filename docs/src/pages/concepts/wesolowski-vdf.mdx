@@ -14,11 +14,17 @@ equation check.
 After computing `y = x^(2^T) mod N`, the prover additionally computes:
 
 ```text
-L = poseidon(N, x, y, T)   Fiat-Shamir challenge (251-bit, bit 192 forced)
+|y|      = min(y, N − y)                       sign-canonical output
+instance = poseidon('VDF_WES_INSTANCE_V1', len(N limbs), N ‖ x ‖ |y| ‖ T)
+seed     = poseidon('VDF_WES_CHALLENGE_V1', instance, nonce)
+L        = low 250 bits of seed, bits 250 and 0 forced
+           (any nonce < 2^16 giving a prime; the prover takes the first, ~87 tries)
 q = floor(2^T / L)         quotient
 r = 2^T mod L              remainder
 π = x^q mod N              the proof
 ```
+
+Limbs are u64 and T is two limbs, so `2^250 ≤ L < 2^251` and `L` is odd.
 
 Note `q` and `r` satisfy `2^T = q·L + r`, so:
 
@@ -29,42 +35,80 @@ x^(2^T) = x^(q·L + r) = (x^q)^L · x^r = π^L · x^r   (mod N)
 ## The verification
 
 ```text
-L = poseidon(N, x, y, T)          ← derived in-program
-r = 2^T mod L                     ← cheap: pow(2, T, L)
-check  π^L · x^r == y  (mod N)    ← joint exponentiation, ~256-bit exponents
+check  N odd, mu_n valid, y < N − y      ← y is sign-canonical
+L = challenge(N, x, y, T, nonce)         ← derived in-program
+check  L passes 20 Miller–Rabin rounds   ← Fiat-Shamir bases from seed
+r = 2^T mod L                            ← native u256: pow(2, T, L)
+check  π^L · x^r == ±y  (mod N)          ← joint exponentiation, ~251-bit exponents
 ```
+
+The check works in the signed group `Z_N^*/{±1}`, so `π` is only defined up
+to sign: `−π` also verifies. In the full group anyone who knew the honest `y`
+could also "prove" `N − y` (negate `π` for an odd challenge) — two valid
+outputs per instance. Accepting only the sign-canonical `y` removes that.
+Tests: `negated_output_rejected`, `negated_proof_verifies`; repro:
+`scripts/repro_issues.py` section C.
 
 The verifier never performs the T squarings. It checks a statement about them
 in O(log T) group operations.
 
 ## Why the challenge L matters
 
-L must be derived from the instance `(N, x, y, T)` — never chosen by the
+L must be derived from the instance `(N, x, |y|, T)` — never chosen by the
 prover. If the prover could pick L, they could fake the proof for **any**
 claimed output: choosing `L = 2^200` (which divides `2^T` for `T ≥ 200`) makes
 `r = 0`, and then `π = 1` "proves" `y = 1` without a single squaring. This
-repo's Cairo verifier therefore derives `L = poseidon(N, x, y, T)` **inside
-the proven program** — binding it onchain is not an option, because the
-onchain side only verifies a proof of execution and cannot re-derive L itself.
-Bit 192 of L is forced so `L ≥ 2^192` always satisfies the Barrett
-precondition, and both Barrett constants are validated in-program.
-`scripts/repro_issues.py` demonstrates the forgery against the old interface;
-`forged_output_rejected` in the test suite pins the fix.
+repo's Cairo verifier therefore derives `L` **inside the proven program** —
+binding it onchain is not an option, because the onchain side only verifies a
+proof of execution and cannot re-derive L itself. The Barrett constant `mu_n`
+for `N` is validated in-program; arithmetic mod `L` uses Cairo's native u256,
+so there is no second constant. `scripts/repro_issues.py` demonstrates the
+forgery against the old interface; `forged_output_rejected` in the test suite
+pins the fix.
 
-Like the Python reference (and Pietrzak's ePrint 2018/627, §4), `L` is a
-random ~251-bit integer rather than a verified prime. Wesolowski's soundness
-proof assumes a prime challenge; with a random challenge the known attacks
-require the prover to factor an RSA-sized integer (`N`, or `L − 1` when it
-factors `N`) — no cheaper than attacking the RSW timelock itself. If you want
-the theorem-level guarantee, generate a prime `L` offchain and add a primality
-certificate check in-program (larger trace; not done here).
+## Why L must be prime
+
+Wesolowski's soundness argument assumes a prime challenge. An earlier version
+used `L = poseidon(N, x, y, T)` with bit 192 forced — a random composite
+integer — on the assumption that attacking it required factoring. **That
+assumption was wrong.** A composite challenge is forgeable without factoring
+`N`:
+
+1. Pick a smooth `M` and `α ≡ 2^T (mod M)` (cheap by CRT).
+2. Grind candidate outputs `y = x^e` with `e = α + kM` until
+   `L = H(.. y ..)` divides `M`.
+3. Then `r = 2^T mod L = e mod L`; set `π = x^((e − r)/L)`, so
+   `π^L · x^r = x^e = y` — a wrong output that verifies.
+
+`scripts/repro_issues.py` section D demonstrates this with a 48-bit truncated
+challenge. The fix is hash-to-prime: the prover supplies a `nonce < 2^16`, and
+the verifier accepts only if the derived `L` passes 20 Miller–Rabin rounds with
+Fiat-Shamir bases
+`base_i = (poseidon('VDF_WES_MILLER_RABIN_V1', seed, 2i) + 2^256·poseidon(…, 2i+1)) mod L`.
+For a random odd 251-bit candidate, a composite passes 20 rounds with
+probability below `2^-107` (Damgård–Landrock–Pomerance average-case bound), so
+grinding nonces for a composite challenge is infeasible. Tests:
+`challenge_is_prime_and_r_calc`, `composite_candidate_fails_primality`,
+`composite_challenge_rejected`.
+
+## The trapdoor holder
+
+Soundness holds only against parties **without** the trapdoor. With a
+bidder-generated `N`, the bidder knows φ(N) and can produce a valid proof for
+**any** `y` on their own puzzle. Applications must treat two different proven
+outputs for one instance as evidence of the trapdoor holder's misbehaviour
+(e.g. void and slash), not accept the first proof as final.
 
 ## In this repo
 
 - `ref/cairo_model_v2.py` — exact Python mirror of the Cairo verification
   algorithm (validates any change before porting).
-- `cairo/lib/src/lib.cairo` — `verify_vdf`: validate the Barrett constants,
-  derive `L`, compute `r = 2^T mod L`, then check `pi^L · x^r == y mod N`.
+- `cairo/lib/src/lib.cairo` — `verify_vdf`: check `N` odd, validate `mu_n`
+  and the sign-canonical `y`, derive `L` (`instance_hash`, `challenge_hash`,
+  `challenge_from_hash`), check `is_probable_prime`, compute `r = 2^T mod L`
+  (`u256_pow_mod`), then check `pi^L · x^r == ±y mod N`.
 - `cairo/exec` — `#[executable] vdf_verify` entrypoint for the proving
-  pipeline; outputs `poseidon(N, x, y, T)` on success so the onchain verifier
-  can bind the proof to the public instance.
+  pipeline; verifies, decrypts, and outputs
+  `[instance_hash, ctx, poseidon(ct), poseidon(pt)]` on success
+  (`[0, 0, 0, 0]` on failure) so the onchain verifier can bind the proof to
+  the public instance and ciphertext.

@@ -30,7 +30,7 @@ def barrett_mu(N_int: int, k: int) -> list[int]:
 
 
 def gen_tests():
-    print("use vdf::{verify_vdf, N_LIMBS, L_LIMBS};")
+    print("use vdf::verify_vdf;")
     print()
     print("#[cfg(test)]")
     print("mod tests {")
@@ -39,9 +39,7 @@ def gen_tests():
     for v in VECTORS:
         name = v["name"]
         N_int = int(v["N"], 16)
-        L_int = int(v["L"], 16)
         muN = barrett_mu(N_int, v["n_limbs"])
-        muL = barrett_mu(L_int, 4)
         T = v["T"]
         T_limbs = [T & ((1 << 64) - 1), (T >> 64) & ((1 << 64) - 1)]
 
@@ -52,10 +50,9 @@ def gen_tests():
         print(f"        let x = {limbs_cairo(v['x_limbs'])};")
         print(f"        let y = {limbs_cairo(v['y_limbs'])};")
         print(f"        let pi = {limbs_cairo(v['pi_limbs'])};")
-        print(f"        let mu_l = {limbs_cairo(muL)};")
         print(f"        let T_limbs = {limbs_cairo(T_limbs)};")
         print(
-            "        assert(verify_vdf(N, mu_n, x, y, pi, mu_l, T_limbs, 2), 'VDF must verify');"
+            f"        assert(verify_vdf(N, mu_n, x, y, pi, T_limbs, {v['nonce']}), 'VDF must verify');"
         )
         print("    }")
         print()

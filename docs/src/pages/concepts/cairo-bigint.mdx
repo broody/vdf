@@ -30,7 +30,11 @@ arithmetic on it directly. This repo uses a validated pattern:
   most significant bit to least significant bit, sharing each squaring. Reduce
   both bases, precompute `pi*x`, then choose the factor from `1`, pi, x, pi*x.
   Both zero exponents return one; the first nonzero factor is copied directly.
-  The separate modpow remains for `2^T mod L`.
+  `L` and `r` arrive as native u256 values split into four u64 limbs.
+- **Arithmetic mod L** (`2^T mod L`, the Miller–Rabin rounds) uses Cairo's
+  native u256 with a u512 wide product and u512-by-u256 division
+  (`u256_mul_mod_n`, `u512_safe_div_rem_by_u256`), via `u256_pow_mod`. No
+  Barrett constant is needed for L.
 
 ## Barrett reduction (HAC 14.42)
 
@@ -57,26 +61,33 @@ primitive must be correct for every modulus. Regression test:
 
 q1 and q3 are span slices rather than array copies. The full q1*mu product
 still computes its low columns: their carry contributes to the retained high
-half. The k+1-limb normalization and both mu validations are unchanged.
+half. The k+1-limb normalization and the `mu_n` validation are unchanged
+(`mu_n` is now the only Barrett constant; `mu_valid` stays generic).
 
 ## Measured execution cost
 
-With Scarb/Cairo 2.18.0, dev profile, `stwo_no_ecop`, T=65536, joint
-exponentiation, felt accumulation and span slices reduce the checked-in
-512-bit vector from 14,838,481 to 5,629,093 steps (62.1%). The checked-in
-2048-bit vector falls from 155,970,789 to 49,429,902 steps (68.3%). At 512
-bits the independent savings are 41.3%, 33.2% and 2.3%; they are not additive.
-These are execution-resource measurements; optimized proof generation and
-onchain transaction gas have not been measured.
+With Scarb/Cairo 2.18.0, dev profile, `stwo_no_ecop`, T=65536, the current
+program (hash-to-prime challenge and in-program decryption included) runs the
+checked-in 512-bit vector in 8,491,007 steps and the 2048-bit vector in
+53,897,839 steps. The 20 Miller–Rabin rounds plus decryption account for
+about +2.9M and +4.5M steps respectively.
+
+Historically, **before hash-to-prime**, joint exponentiation, felt
+accumulation and span slices reduced the 512-bit vector from 14,838,481 to
+5,629,093 steps (62.1%) and the 2048-bit vector from 155,970,789 to
+49,429,902 steps (68.3%). At 512 bits the independent savings were 41.3%,
+33.2% and 2.3%; they are not additive. These are execution-resource
+measurements; optimized proof generation and onchain transaction gas have not
+been measured.
 
 ## Per-modulus limb domains
 
-Each modulus gets its own limb count and Barrett constant:
+Each modulus gets its own representation:
 
-| Modulus | Size | Limbs |
+| Modulus | Size | Representation |
 |---|---|---|
-| N (RSA modulus) | 512-bit demo / 2048-bit production | 8 / 32 |
-| L (Wesolowski challenge) | 251-bit + forced bit 192 | 4 |
+| N (RSA modulus) | 512-bit demo / 2048-bit production | 8 / 32 u64 limbs, Barrett with validated `mu_n` |
+| L (Wesolowski challenge) | 251-bit prime (`2^250 ≤ L < 2^251`) | native u256; 4 u64 limbs as an exponent |
 
 Mixing domains breaks the reduction (an infinite normalize loop — the other
 real bug the Python model caught).

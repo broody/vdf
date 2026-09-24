@@ -10,16 +10,19 @@ Everything is generated from the Python reference — no hand-written constants.
 ## Generate vectors
 
 ```sh
-python3 ref/vdf_reference.py [output.json]
+python3 ref/vdf_reference.py
 ```
 
-Writes an array of vectors, each containing: `N`, `x`, `y`, `π`, `L`, `r`
-(as limb arrays), `T`, and the RSA parameters. `L` is the Fiat-Shamir
-challenge `poseidon(N, x, y, T)` with bit 192 forced — the same derivation
-the Cairo verifier performs in-program (`ref/poseidon.py` is cross-checked
-against the Cairo builtin). The reference asserts the RSW φ(N) shortcut
-equals sequential squaring, and that the Wesolowski proof verifies, before
-emitting.
+Writes `vectors/vdf_vectors_512.json` and `vectors/vdf_vectors_2048.json`
+(T = 2^16), each containing: `N`, `x`, `y`, `π`, `L`, `r` (as limb arrays),
+`T`, `nonce`, `instance_hash`, and the RSW decryption fields `ctx`,
+`plaintext`, `ciphertext`, `ct_hash`, `pt_hash`. `y` is the sign-canonical
+output `min(y, N − y)`. `L` is the hash-to-prime challenge: the smallest
+`nonce` whose candidate from `poseidon('VDF_WES_CHALLENGE_V1', instance, nonce)`
+is prime — the same derivation the Cairo verifier performs in-program
+(`ref/poseidon.py` is cross-checked against the Cairo builtin). The reference
+asserts the RSW φ(N) shortcut equals sequential squaring, and that the
+Wesolowski proof verifies, before emitting.
 
 ## Regenerate Cairo tests
 
@@ -28,9 +31,11 @@ python3 scripts/regen_clean_tests.py
 python3 scripts/gen_arithmetic_tests.py
 ```
 
-Writes `cairo/lib/src/tests.cairo` — unit tests for both limb domains, the
-Barrett boundary regression, mu validation, plus the full-verify and
-forgery-rejection tests (six tests). `gen_arithmetic_tests.py` writes 31
+Writes `cairo/lib/src/tests.cairo` — eleven tests: modmul, the prime
+challenge and `r` calculation, composite-candidate and composite-challenge
+rejection, the Barrett boundary regression, mu validation, forged- and
+negated-output rejection, full verification, negated-proof acceptance and
+the RSW keystream roundtrip. `gen_arithmetic_tests.py` writes 31
 additional tests to `arithmetic_tests.cairo`, using Python integer arithmetic
 as the oracle and seed 20260907. These cover full and noncanonical operands
 at 256–2048 bits and zero, sparse, dense and random exponent pairs.
@@ -38,13 +43,17 @@ at 256–2048 bits and zero, sparse, dense and random exponent pairs.
 ## Regenerate executable arguments
 
 ```sh
-python3 scripts/write_exec_512.py
+python3 scripts/write_exec_args.py
 ```
 
-Writes `vectors/exec_args_512.json` — the flat felt252 input array for
-`scarb execute`, with the leading Span-length felt. Layout:
-`[N(8), mu_n(9), x(8), y(8), pi(8), mu_l(5), T(2)]` — the challenge `L` and
-`r` are **not** inputs; they are derived in-program.
+Writes `vectors/exec_args_512.json` and `vectors/exec_args_2048.json` — the
+flat felt252 input arrays for `scarb execute`, with the leading Span-length
+felt. Layout:
+`[N(k), mu_n(k+1), x(k), y(k), pi(k), T(2), nonce, ctx, ct_len, ct(ct_len)]`
+with k = 8 or 32; the input length must match exactly. The challenge `L` and
+`r` are **not** inputs; they are derived in-program, and there is no longer a
+`mu_l` constant. The script prints the expected output
+`[instance_hash, ctx, ct_hash, pt_hash]`.
 
 ## Validate model changes first
 

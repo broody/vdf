@@ -17,10 +17,17 @@ that decryption provably requires T sequential modular squarings.
 ## Encryption (instant — encryptor's shortcut)
 
 ```text
-y = x^(2^T mod φ(N)) mod N
-key = KDF(y)
-ciphertext = AEAD_encrypt(key, message)
+y   = x^(2^T mod φ(N)) mod N
+|y| = min(y, N − y)
+key = poseidon('VDF_RSW_KEY_V1', ctx, len(y limbs), |y| limbs)
+ct_i = pt_i + poseidon(key, i)      Poseidon keystream over the Stark field
 ```
+
+`ctx` is an application context felt (e.g. `H(auction, bid)`), so one puzzle
+output never yields the same key in two contexts. Messages are felt252 arrays.
+There is **no integrity tag** by design: the application posts a commitment
+`poseidon(pt)` with the ciphertext and checks the decrypted plaintext against
+it.
 
 Because the encryptor knows φ(N), they can reduce the exponent `2^T mod φ(N)`
 and compute y in O(log T) multiplications. The factors can then be **discarded**.
@@ -29,8 +36,8 @@ and compute y in O(log T) multiplications. The factors can then be **discarded**
 
 ```text
 y = x^(2^T) mod N        — T sequential squarings
-key = KDF(y)
-message = AEAD_decrypt(key, ciphertext)
+key = poseidon('VDF_RSW_KEY_V1', ctx, len(y limbs), |y| limbs)
+pt_i = ct_i − poseidon(key, i)
 ```
 
 Each squaring depends on the previous one, so the work is inherently
@@ -51,4 +58,7 @@ sequential — this is the "time lock". The key exists only after ~T squarings.
 
 `ref/vdf_reference.py` implements RSW with a safe-prime check that the φ(N)
 shortcut equals sequential squaring, and generates the test vectors in
-`vectors/`.
+`vectors/`. The Cairo executable decrypts in-program (`derive_key`,
+`decrypt`; `encrypt` is the inverse) after verifying the VDF, and outputs
+`poseidon(ct)` and `poseidon(pt)` so the onchain side can match them against
+the stored ciphertext and the bid commitment. Test: `rsw_keystream_roundtrip`.

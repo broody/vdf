@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Regenerate a clean tests.cairo: 3 gas-cheap passing tests + 1 ignored full-verify."""
+"""Regenerate cairo/lib/src/tests.cairo from the 512-bit vector.
+
+Covers both limb domains, the prime challenge, the signed-group output rule,
+the historical forgeries (chosen challenge, -1 malleability, composite
+challenge) and the RSW Poseidon keystream.
+"""
 import json
 import os
 import sys
@@ -10,15 +15,21 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, os.path.join(ROOT, "ref"))
 from gen_cairo_tests import barrett_mu  # noqa: E402
 import cairo_model_v2 as m  # noqa: E402
+from vdf_reference import (  # noqa: E402
+    derive_challenge, find_challenge, is_prime_fs, limbify,
+)
 
 v = json.load(open(os.path.join(ROOT, "vectors", "vdf_vectors_512.json")))[0]
 kN = v["n_limbs"]
 kL = 4
 N_int = int(v["N"], 16)
+x_int = int(v["x"], 16)
+y_int = int(v["y"], 16)
 L_int = int(v["L"], 16)
+pi_int = int(v["pi"], 16)
+T = v["T"]
 muN = barrett_mu(N_int, kN)
 muL = barrett_mu(L_int, kL)
-T = v["T"]
 T_limbs = [T & ((1 << 64) - 1), (T >> 64) & ((1 << 64) - 1)]
 
 
@@ -26,124 +37,179 @@ def arr(limbs):
     return "array![" + ", ".join(str(x) for x in limbs) + "].span()"
 
 
+def felts(values):
+    return "array![" + ", ".join(values) + "].span()"
+
+
+def nl(value):
+    return arr(limbify(value, 64, kN))
+
+
 xsq = m.modmul(v["x_limbs"], v["x_limbs"], v["N_limbs"], muN, kN)
-r_calc = m.modpow(m.to_limbs(2, kL), m.to_limbs(T, 2), 2, m.to_limbs(L_int, kL), muL, kL)
 
-out = []
-out.append("use vdf::{modmul, modpow, limbs_eq, verify_vdf, N_LIMBS, L_LIMBS};")
-out.append("")
-out.append("#[cfg(test)]")
-out.append("mod tests {")
-out.append("    use super::*;")
-out.append("")
-out.append("    // Gas-cheap checks that exercise both limb domains, plus the full")
-out.append("    // verification (positive + forged-negative) which now fits the gas cap.")
-out.append("    #[test]")
-out.append("    fn modmul_x_squared() {")
-out.append(f"        let N = {arr(v['N_limbs'])};")
-out.append(f"        let mu_n = {arr(muN)};")
-out.append(f"        let x = {arr(v['x_limbs'])};")
-out.append("        let got = modmul(x, x, N, mu_n, N_LIMBS);")
-out.append(f"        let exp = {arr(xsq)};")
-out.append("        assert(limbs_eq(got.span(), exp, N_LIMBS), 'x^2 mod N');")
-out.append("    }")
-out.append("")
-out.append("    // Challenge derivation (in-program Fiat-Shamir) + r = 2^T mod L.")
-out.append("    #[test]")
-out.append("    fn r_calc_2_to_T_mod_L() {")
-out.append(f"        let N = {arr(v['N_limbs'])};")
-out.append(f"        let x = {arr(v['x_limbs'])};")
-out.append(f"        let y = {arr(v['y_limbs'])};")
-out.append(f"        let mu_l = {arr(muL)};")
-out.append(f"        let T_limbs = {arr(T_limbs)};")
-out.append("        let L = vdf::derive_challenge(N, x, y, T_limbs);")
-out.append(f"        let exp_L = {arr(v['L_limbs'][:4])};")
-out.append("        assert(limbs_eq(L.span(), exp_L, L_LIMBS), 'L = H(N,x,y,T)');")
-out.append("        let mut two = ArrayTrait::new();")
-out.append("        two.append(2);")
-out.append("        let mut i: usize = 1;")
-out.append("        while i < L_LIMBS {")
-out.append("            two.append(0);")
-out.append("            i += 1;")
-out.append("        }")
-out.append("        let got = modpow(two.span(), T_limbs, 2, L.span(), mu_l, L_LIMBS);")
-out.append(f"        let exp = {arr(r_calc)};")
-out.append("        assert(limbs_eq(got.span(), exp, L_LIMBS), '2^T mod L');")
-out.append("    }")
-out.append("")
-out.append("    // Regression for the Barrett k-limb truncation bug: with N = 2^512-1,")
-out.append("    // a = 2^448-1, b = 2^448+1 the quotient estimate undershoots by 1 and")
-out.append("    // p - q3*N = b^k + (2^384 - 2) >= b^k; keeping only k limbs wrapped r and")
-out.append("    // returned p mod N - 1. HAC 14.42 keeps k+1 limbs and gets 2^384 - 1.")
-out.append("    #[test]")
-out.append("    fn barrett_boundary_top_limb_all_ones() {")
-out.append("        let f = 18446744073709551615;")
-out.append("        let N = array![f, f, f, f, f, f, f, f].span();")
-out.append("        let mu_n = array![1, 0, 0, 0, 0, 0, 0, 0, 1].span();")
-out.append("        let a = array![f, f, f, f, f, f, f, 0].span();")
-out.append("        let b = array![1, 0, 0, 0, 0, 0, 0, 1].span();")
-out.append("        let got = modmul(a, b, N, mu_n, N_LIMBS);")
-out.append("        let exp = array![f, f, f, f, f, f, 0, 0].span(); // 2^384 - 1")
-out.append("        assert(limbs_eq(got.span(), exp, N_LIMBS), 'barrett boundary');")
-out.append("    }")
-out.append("")
-out.append("    // The Barrett constants are validated in-program: a tampered mu")
-out.append("    // (here: top limb decremented) must be rejected in both domains.")
-out.append("    #[test]")
-out.append("    fn mu_validation_accepts_and_rejects() {")
-out.append(f"        let N = {arr(v['N_limbs'])};")
-out.append(f"        let mu_n = {arr(muN)};")
-out.append(f"        let mu_l = {arr(muL)};")
-out.append(f"        let L = {arr(v['L_limbs'][:4])};")
-out.append("        assert(vdf::mu_valid(N, mu_n, N_LIMBS), 'mu_n valid');")
-out.append("        assert(vdf::mu_valid(L, mu_l, L_LIMBS), 'mu_l valid');")
-mun_bad = muN.copy(); mun_bad[-1] -= 1
-mul_bad = muL.copy(); mul_bad[-1] -= 1
-out.append(f"        let mu_n_bad = {arr(mun_bad)};")
-out.append(f"        let mu_l_bad = {arr(mul_bad)};")
-out.append("        assert(!vdf::mu_valid(N, mu_n_bad, N_LIMBS), 'mu_n bad');")
-out.append("        assert(!vdf::mu_valid(L, mu_l_bad, L_LIMBS), 'mu_l bad');")
-out.append("    }")
-out.append("")
-# mu_l for the FORGED instance (y' = 1): the forger plays along with the
-# in-program challenge derivation, so rejection must come from the Wesolowski
-# equation itself, not from mu validation.
-from vdf_reference import derive_challenge  # noqa: E402
+# Chosen-output forgery y' = 1, pi = 1, with a genuinely prime challenge for
+# that instance: rejection must come from the Wesolowski equation.
+nonce_one, L_one = find_challenge(N_int, x_int, 1, T, kN)
 
-L_forged = derive_challenge(N_int, int(v["x"], 16), 1, T, kN)
-mu_l_forged = barrett_mu(L_forged, kL)
+# -1 malleability: y' = N - y with pi' = -(x^floor(2^T/L')). L' is always odd,
+# so pi'^L' * x^r' == y' exactly; only the sign-canonical rule rejects it.
+y_neg = N_int - y_int
+nonce_neg, L_neg = find_challenge(N_int, x_int, y_neg, T, kN)
+pi_neg = N_int - pow(x_int, (1 << T) // L_neg, N_int)
+assert pow(pi_neg, L_neg, N_int) * pow(x_int, pow(2, T, L_neg), N_int) % N_int == y_neg
 
-out.append("    // The Bug-A forgery (claim y'=1 with pi=1, formerly accepted via a")
-out.append("    // freely chosen challenge L = 2^200, r = 0, pi = 1) must now fail: L is")
-out.append("    // derived in-program from (N, x, y', T), and mu_l here is the VALID")
-out.append("    // constant for that derived L — rejection comes from the Wesolowski")
-out.append("    // equation, not mu validation. The exec-level check is in")
-out.append("    // scripts/repro_issues.py.")
-out.append("    #[test]")
-out.append("    fn forged_output_rejected() {")
-out.append(f"        let N = {arr(v['N_limbs'])};")
-out.append(f"        let mu_n = {arr(muN)};")
-out.append(f"        let x = {arr(v['x_limbs'])};")
-out.append(f"        let mu_l = {arr(mu_l_forged)};")
-out.append("        let y_fake = array![1, 0, 0, 0, 0, 0, 0, 0].span();")
-out.append("        let pi_fake = array![1, 0, 0, 0, 0, 0, 0, 0].span();")
-out.append(f"        let T_limbs = {arr(T_limbs)};")
-out.append("        assert(!verify_vdf(N, mu_n, x, y_fake, pi_fake, mu_l, T_limbs, 2), 'forgery');")
-out.append("    }")
-out.append("")
-out.append("    // Full Wesolowski check — post-optimization it fits cairo-test's")
-out.append("    // 2^32 gas cap (~0.72B gas), so it runs in the default test run.")
-out.append("    #[test]")
-out.append("    fn full_wesolowski_verifies() {")
-out.append(f"        let N = {arr(v['N_limbs'])};")
-out.append(f"        let mu_n = {arr(muN)};")
-out.append(f"        let x = {arr(v['x_limbs'])};")
-out.append(f"        let y = {arr(v['y_limbs'])};")
-out.append(f"        let pi = {arr(v['pi_limbs'])};")
-out.append(f"        let mu_l = {arr(muL)};")
-out.append(f"        let T_limbs = {arr(T_limbs)};")
-out.append("        assert(verify_vdf(N, mu_n, x, y, pi, mu_l, T_limbs, 2), 'vdf');")
-out.append("    }")
-out.append("}")
-open(os.path.join(ROOT, "cairo", "lib", "src", "tests.cairo"), "w").write("\n".join(out) + "\n")
-print("tests.cairo regenerated (6 passing, none ignored)")
+# Composite challenge: the first nonce whose candidate fails the primality
+# test, with an honest pi for that composite L. The equation holds.
+nonce_comp = next(
+    n for n in range(1 << 16)
+    if not is_prime_fs(*derive_challenge(N_int, x_int, y_int, T, kN, n))
+)
+L_comp = derive_challenge(N_int, x_int, y_int, T, kN, nonce_comp)[0]
+pi_comp = pow(x_int, (1 << T) // L_comp, N_int)
+lhs_comp = pow(pi_comp, L_comp, N_int) * pow(x_int, pow(2, T, L_comp), N_int) % N_int
+assert lhs_comp in (y_int, N_int - y_int)
+
+VECTOR = f"""        let N = {arr(v['N_limbs'])};
+        let mu_n = {arr(muN)};
+        let x = {arr(v['x_limbs'])};
+        let T_limbs = {arr(T_limbs)};"""
+
+out = f"""use vdf::{{
+    L_LIMBS, N_LIMBS, challenge_from_hash, challenge_hash, decrypt, derive_key, encrypt,
+    instance_hash, is_probable_prime, limbs_eq, modmul, mu_valid, u256_pow_mod, verify_vdf,
+}};
+
+// Generated by scripts/regen_clean_tests.py from vectors/vdf_vectors_512.json.
+#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    #[test]
+    fn modmul_x_squared() {{
+{VECTOR}
+        let got = modmul(x, x, N, mu_n, N_LIMBS);
+        let exp = {arr(xsq)};
+        assert(limbs_eq(got.span(), exp, N_LIMBS), 'x^2 mod N');
+    }}
+
+    // Instance hash, prime challenge (nonce {v['nonce']}) and r = 2^T mod L.
+    #[test]
+    fn challenge_is_prime_and_r_calc() {{
+{VECTOR}
+        let y = {arr(v['y_limbs'])};
+        let inst = instance_hash(N, x, y, T_limbs);
+        assert(inst == {v['instance_hash']}, 'instance hash');
+        let seed = challenge_hash(inst, {v['nonce']});
+        let L = challenge_from_hash(seed);
+        assert(L == {v['L']}, 'L = H(inst, nonce)');
+        assert(is_probable_prime(L, seed), 'L prime');
+        let got = u256_pow_mod(2, {T}, L.try_into().unwrap());
+        assert(got == {v['r']}, '2^T mod L');
+    }}
+
+    // Nonce {nonce_comp} yields a composite candidate; Miller-Rabin must reject it.
+    #[test]
+    fn composite_candidate_fails_primality() {{
+        let seed = challenge_hash({v['instance_hash']}, {nonce_comp});
+        let L = challenge_from_hash(seed);
+        assert(L == {hex(L_comp)}, 'composite L');
+        assert(!is_probable_prime(L, seed), 'composite rejected');
+    }}
+
+    // Regression for the Barrett k-limb truncation bug: with N = 2^512-1,
+    // a = 2^448-1, b = 2^448+1 the quotient estimate undershoots by 1 and
+    // p - q3*N = b^k + (2^384 - 2) >= b^k; keeping only k limbs wrapped r and
+    // returned p mod N - 1. HAC 14.42 keeps k+1 limbs and gets 2^384 - 1.
+    #[test]
+    fn barrett_boundary_top_limb_all_ones() {{
+        let f = 18446744073709551615;
+        let N = array![f, f, f, f, f, f, f, f].span();
+        let mu_n = array![1, 0, 0, 0, 0, 0, 0, 0, 1].span();
+        let a = array![f, f, f, f, f, f, f, 0].span();
+        let b = array![1, 0, 0, 0, 0, 0, 0, 1].span();
+        let got = modmul(a, b, N, mu_n, N_LIMBS);
+        let exp = array![f, f, f, f, f, f, 0, 0].span(); // 2^384 - 1
+        assert(limbs_eq(got.span(), exp, N_LIMBS), 'barrett boundary');
+    }}
+
+    // mu_valid rejects a tampered Barrett constant (top limb decremented) for
+    // both a k-limb N and a 4-limb modulus.
+    #[test]
+    fn mu_validation_accepts_and_rejects() {{
+        let N = {arr(v['N_limbs'])};
+        let mu_n = {arr(muN)};
+        let mu_l = {arr(muL)};
+        let L = {arr(v['L_limbs'])};
+        assert(mu_valid(N, mu_n, N_LIMBS), 'mu_n valid');
+        assert(mu_valid(L, mu_l, L_LIMBS), 'mu_l valid');
+        let mu_n_bad = {arr(muN[:-1] + [muN[-1] - 1])};
+        let mu_l_bad = {arr(muL[:-1] + [muL[-1] - 1])};
+        assert(!mu_valid(N, mu_n_bad, N_LIMBS), 'mu_n bad');
+        assert(!mu_valid(L, mu_l_bad, L_LIMBS), 'mu_l bad');
+    }}
+
+    // Chosen-output forgery: claim y' = 1 with pi = 1. The challenge for that
+    // instance is a genuine prime (nonce {nonce_one}), so rejection comes from
+    // the Wesolowski equation.
+    #[test]
+    fn forged_output_rejected() {{
+{VECTOR}
+        let y_fake = {nl(1)};
+        let pi_fake = {nl(1)};
+        assert(!verify_vdf(N, mu_n, x, y_fake, pi_fake, T_limbs, {nonce_one}), 'forgery');
+    }}
+
+    // -1 malleability: y' = N - y with pi' = -(x^floor(2^T/L')) satisfies
+    // pi'^L' * x^r' == y' exactly (L' is odd), with a prime challenge
+    // (nonce {nonce_neg}). y' is not sign-canonical, so it must be rejected.
+    #[test]
+    fn negated_output_rejected() {{
+{VECTOR}
+        let y_neg = {nl(y_neg)};
+        let pi_neg = {nl(pi_neg)};
+        assert(!verify_vdf(N, mu_n, x, y_neg, pi_neg, T_limbs, {nonce_neg}), 'N - y');
+    }}
+
+    // Composite challenge with an honest pi for it: the equation holds, the
+    // primality check must still reject (smooth-challenge forgeries need it).
+    #[test]
+    fn composite_challenge_rejected() {{
+{VECTOR}
+        let y = {arr(v['y_limbs'])};
+        let pi = {nl(pi_comp)};
+        assert(!verify_vdf(N, mu_n, x, y, pi, T_limbs, {nonce_comp}), 'composite L');
+    }}
+
+    #[test]
+    fn full_wesolowski_verifies() {{
+{VECTOR}
+        let y = {arr(v['y_limbs'])};
+        let pi = {arr(v['pi_limbs'])};
+        assert(verify_vdf(N, mu_n, x, y, pi, T_limbs, {v['nonce']}), 'vdf');
+    }}
+
+    // The proof is only defined up to sign in Z_N^* / {{±1}}: -pi also verifies.
+    #[test]
+    fn negated_proof_verifies() {{
+{VECTOR}
+        let y = {arr(v['y_limbs'])};
+        let pi = {nl(N_int - pi_int)};
+        assert(verify_vdf(N, mu_n, x, y, pi, T_limbs, {v['nonce']}), 'vdf -pi');
+    }}
+
+    #[test]
+    fn rsw_keystream_roundtrip() {{
+        let y = {arr(v['y_limbs'])};
+        let key = derive_key({v['ctx']}, y);
+        let pt = {felts(v['plaintext'])};
+        let ct = {felts(v['ciphertext'])};
+        let got = decrypt(key, ct);
+        assert(got.span() == pt, 'decrypt');
+        assert(encrypt(key, pt).span() == ct, 'encrypt');
+        assert(core::poseidon::poseidon_hash_span(ct) == {v['ct_hash']}, 'ct hash');
+        assert(core::poseidon::poseidon_hash_span(pt) == {v['pt_hash']}, 'pt hash');
+    }}
+}}
+"""
+open(os.path.join(ROOT, "cairo", "lib", "src", "tests.cairo"), "w").write(out)
+print("tests.cairo regenerated (11 tests)")

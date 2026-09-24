@@ -33,8 +33,10 @@ flowchart LR
 ```
 
 - **RSW encryption → whisper `sdk/`**: bidders generate the RSA modulus and
-  timelock-encrypt their opening at bid time. It lives in the bid flow, not in
-  a second package.
+  timelock-encrypt their opening at bid time (Poseidon keystream under
+  `poseidon('VDF_RSW_KEY_V1', ctx, |y|)`, with `ctx = H(auction, bid)`),
+  posting the ciphertext alongside the bid commitment. It lives in the bid
+  flow, not in a second package.
 - **`reveal_bid` → whisper `contracts/`**: additive permissionless entrypoint,
   gated on `now >= force_reveal_after`, reusing the existing commitment check.
   No STRK20 pool-callback breakage.
@@ -53,12 +55,19 @@ flowchart LR
 
 ## Production notes
 
-- **The challenge is already bound in-program**: the verifier derives
-  `L = poseidon(N, x, y, T)` itself and validates both Barrett constants, so
-  a prover cannot choose `L` (or a bogus `mu`) to fit a forged `y`. The
-  executable outputs `poseidon(N, x, y, T)` on success — the contract treats
-  `(N, x, y, T)` as public inputs and compares that hash, binding the Stwo
-  proof to the exact instance.
+- **The challenge is already bound in-program**: the verifier derives a
+  251-bit prime `L` from `(N, x, |y|, T, nonce)` itself (hash-to-prime, 20
+  Miller–Rabin rounds), works in the signed group `Z_N^*/{±1}` with the
+  sign-canonical `|y|`, and validates `mu_n`, so a prover cannot choose `L`
+  (or a bogus `mu`) to fit a forged `y`. The executable also decrypts
+  in-program and outputs `[instance_hash, ctx, poseidon(ct), poseidon(pt)]` —
+  the contract recomputes `instance_hash` and `poseidon(ct)` from the stored
+  puzzle and ciphertext and compares `poseidon(pt)` with the bid commitment,
+  binding the Stwo proof to the exact instance.
+- **The bidder can prove any output on their own puzzle**: they know φ(N), so
+  a VDF proof is only sound against parties without the trapdoor. Treat two
+  different proven outputs for one instance as evidence of the bidder's
+  misbehaviour (e.g. void the bid and slash), not the first proof as final.
 - **Settlement does not need a VDF proof per bid**: the VDF guarantees the
   key is *available* to anyone at the deadline; settlement only needs a valid
   commitment opening (amount + salt). A solver decrypts offchain and submits

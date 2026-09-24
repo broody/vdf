@@ -12,27 +12,32 @@ Requires **scarb ≥ 2.20** (ships `scarb execute`, `scarb prove`, `scarb verify
 ```sh
 cd cairo/lib
 scarb test
-# 37 passed — arithmetic at 256/512/1024/2048 bits, Barrett and mu checks,
-# joint-exponentiation edges, full Wesolowski verification and forgery rejection
+# 42 passed — 31 arithmetic (256/512/1024/2048 bits, joint-exponentiation edges)
+# + 11 verifier: Barrett and mu checks, prime challenge, full Wesolowski
+# verification, forgery / negated-output / composite-challenge rejection,
+# RSW keystream roundtrip
 ```
 
-The full verification now fits cairo-test's 2^32 gas cap (~0.72B gas after the
-bigint optimization pass), so the positive *and* forged-negative paths run in
+The full verification fits cairo-test's 2^32 gas cap (~1.09B gas with the
+hash-to-prime challenge), so the positive *and* forged-negative paths run in
 the default test run.
 
 ## 2. Run the full verification as an executable (gas off)
 
 ```sh
 cd ../exec
-python3 ../../scripts/write_exec_512.py   # writes vectors/exec_args_512.json
+python3 ../../scripts/write_exec_args.py  # writes vectors/exec_args_{512,2048}.json
 scarb execute --arguments-file ../../vectors/exec_args_512.json --print-program-output
-# Program output: <instance_hash>   <- poseidon(N, x, y, T); 0 means rejection
+# Program output: <instance_hash> <ctx> <poseidon(ct)> <poseidon(pt)>
+# [0, 0, 0, 0] means rejection
 ```
 
-This runs the ~5.63M-step computation with gas disabled — the same path the
-prover will consume. The output is the instance hash, not a boolean: the
-onchain verifier recomputes `poseidon(N, x, y, T)` from the public instance
-and compares, binding the proof to that exact `(N, x, y, T)`.
+This runs the ~8.49M-step computation with gas disabled — the same path the
+prover will consume. It verifies the VDF, then decrypts the ciphertext under
+the key derived from `|y|` and `ctx`. The output is not a boolean: the onchain
+side recomputes `instance_hash` and `poseidon(ct)` from its stored puzzle and
+ciphertext and compares `poseidon(pt)` with the bid commitment, binding the
+proof to that exact instance and ciphertext.
 
 ## 3. Prove the execution (big machine)
 
@@ -46,7 +51,7 @@ scarb verify --proof-file target/execute/vdf_exec/execution1/proof/proof.json
 > **Proving measurements**: the historical 14.8M-step 512-bit program generated
 > a proof in ~90s on a 64GB box; verification then hit an ECDSA-segment assertion
 > ([stwo-cairo#1733](https://github.com/starkware-libs/stwo-cairo/issues/1733)).
-> The optimized 5.63M-step trace has been executed and tested, but proving
+> The current 8.49M-step trace has been executed and tested, but proving
 > time, memory use and proof verification have not yet been measured.
 
 ## Modulus sizes

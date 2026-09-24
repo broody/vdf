@@ -15,9 +15,12 @@ description: The RSW timelock + Wesolowski proof flow, end to end.
    ```
 
    Because they know φ(N), the exponent `2^T mod φ(N)` is cheap. The message
-   (e.g. a bid opening `(amount, salt)`) is AEAD-encrypted under a key derived
-   from y. The factors p, q can then be **discarded** — nobody else ever needs
-   them.
+   (e.g. a bid opening `(amount, salt)`, as felt252s) is encrypted with a
+   Poseidon keystream under `key = poseidon('VDF_RSW_KEY_V1', ctx, |y|)`,
+   where `|y| = min(y, N−y)` and `ctx` is an application context such as
+   `H(auction, bid)`. There is no integrity tag: the application posts a
+   commitment `poseidon(pt)` alongside the ciphertext. The factors p, q can
+   then be **discarded** — nobody else ever needs them.
 
 2. **Delay (sequential).** To decrypt, anyone must compute:
 
@@ -32,21 +35,27 @@ description: The RSW timelock + Wesolowski proof flow, end to end.
    Wesolowski proof:
 
    ```text
-   L = poseidon(N, x, y, T)      challenge from the instance
+   |y|  = min(y, N − y)                      sign-canonical output
+   seed = poseidon(instance(N, x, |y|, T), nonce)
+   L    = 251-bit candidate from seed        first nonce giving a prime
    q = floor(2^T / L),  r = 2^T mod L
-   π = x^q mod N                 the proof
+   π = x^q mod N                             the proof
    ```
 
 4. **Verify (O(log T)).** A verifier checks one equation:
 
    ```text
-   y == π^L · x^r  (mod N)
+   π^L · x^r == ±|y|  (mod N)      in the signed group Z_N^*/{±1}
    ```
 
-   Joint exponentiation shares the squarings across the two ~256-bit
-   exponents. The challenge `L` is derived inside the
-   verifier itself (in-program, from the instance) so the prover cannot pick
-   a favorable one — see *Concepts → Wesolowski VDF*.
+   Joint exponentiation shares the squarings across the two ~251-bit
+   exponents. The challenge `L` is derived inside the verifier itself
+   (in-program, from the instance and nonce) and must pass 20 Miller–Rabin
+   rounds, so the prover cannot pick a favorable one — see
+   *Concepts → Wesolowski VDF*. The same program then decrypts the
+   ciphertext under the key from `|y|` and outputs
+   `[instance_hash, ctx, poseidon(ct), poseidon(pt)]`; the application
+   compares `poseidon(pt)` with the posted commitment.
 
 ## Why the encryptor isn't a trusted party
 

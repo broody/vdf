@@ -177,8 +177,10 @@ def mu_valid(m_int: int, mu: list[int], k: int) -> bool:
 
 
 def verify_vector(v: dict) -> bool:
-    """Mirror of Cairo verify_vdf: challenge derived in-program, mu validated."""
-    from vdf_reference import derive_challenge
+    """Mirror of Cairo verify_vdf: sign-canonical y, prime challenge derived
+    in-program (Cairo does the L-domain arithmetic in native u256, mirrored
+    by vdf_reference), mu_n validated, ±y accepted."""
+    from vdf_reference import derive_challenge, is_prime_fs
 
     kN = v["n_limbs"]
     N = v["N_limbs"]
@@ -187,22 +189,25 @@ def verify_vector(v: dict) -> bool:
     pi = v["pi_limbs"]
     T = v["T"]
     N_int = int(v["N"], 16)
+    y_int = int(v["y"], 16)
     kL = 4
 
-    L_int = derive_challenge(N_int, int(v["x"], 16), int(v["y"], 16), T, kN)
+    if N_int % 2 == 0 or not y_int < N_int - y_int:
+        return False
+    L_int, seed = derive_challenge(N_int, int(v["x"], 16), y_int, T, kN, v["nonce"])
     assert L_int == int(v["L"], 16), "stored L must match the derived challenge"
     L = to_limbs(L_int, kL)
 
     muN = barrett_mu(N_int, kN)
-    muL = barrett_mu(L_int, kL)
     assert mu_valid(N_int, muN, kN)
-    assert mu_valid(L_int, muL, kL)
+    if not is_prime_fs(L_int, seed):
+        return False
 
-    r_calc = modpow(to_limbs(2, kL), to_limbs(T, 2), 2, L, muL, kL)
+    r_calc = to_limbs(pow(2, T, L_int), kL)
     assert from_limbs(r_calc) == int(v["r"], 16), f"r mismatch: {from_limbs(r_calc):x}"
 
-    lhs = joint_modpow(pi, L, x, r_calc, N, muN, kN)
-    return from_limbs(lhs) == int(v["y"], 16)
+    lhs = from_limbs(joint_modpow(pi, L, x, r_calc, N, muN, kN))
+    return lhs in (y_int, N_int - y_int)
 
 
 if __name__ == "__main__":
@@ -210,6 +215,8 @@ if __name__ == "__main__":
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    vectors = json.load(open(os.path.join(root, "vectors", "vdf_vectors_512.json")))
+    vectors = []
+    for bits in (512, 2048):
+        vectors += json.load(open(os.path.join(root, "vectors", f"vdf_vectors_{bits}.json")))
     for v in vectors:
         print(f"{v['name']}: {'PASS' if verify_vector(v) else 'FAIL'}")

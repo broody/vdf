@@ -23,7 +23,7 @@ The **historical**, pre-optimization 512-bit execution (14.8M steps) produced
 ~660MB of prover input and a ~590MB proof in ~90s on a 64GB box. Verification
 of that run hit `ECDSA segment is not empty`, recorded in
 [`stwo-cairo#1733`](https://github.com/starkware-libs/stwo-cairo/issues/1733).
-The optimized 5.63M-step (512-bit) and 49.43M-step (2048-bit) executions have
+The current 8.49M-step (512-bit) and 53.90M-step (2048-bit) executions have
 been tested, but their proving time, memory, proof size and proof verification
 have not been measured. Execution savings are not measured transaction-gas savings.
 
@@ -35,7 +35,7 @@ Cairo, runnable inside the Cairo VM. This enables:
 - **Recursive proving**: a Cairo program that verifies a Stwo Cairo proof can
   itself be proven, yielding a proof tree.
 - **Onchain settlement**: a Starknet tx verifies the small proof instead of
-  executing the ~5.63M-step (512-bit) / ~49.43M-step (2048-bit) computation.
+  executing the ~8.49M-step (512-bit) / ~53.90M-step (2048-bit) computation.
 
 ## Gotchas learned the hard way
 
@@ -56,7 +56,17 @@ Cairo, runnable inside the Cairo VM. This enables:
 
 ## Performance
 
-With Scarb/Cairo 2.18.0, dev profile, `stwo_no_ecop`, T=65536:
+With Scarb/Cairo 2.18.0, dev profile, `stwo_no_ecop`, T=65536, current
+program:
+
+| Modulus | Steps |
+|---|---:|
+| 512-bit | 8,491,007 |
+| 2048-bit | 53,897,839 |
+
+The 20 Miller–Rabin rounds on the challenge plus in-program decryption add
+about 2.9M / 4.5M steps. Historical optimization pass, measured **before**
+hash-to-prime and decryption:
 
 | Modulus | Before | Optimized | Step reduction |
 |---|---:|---:|---:|

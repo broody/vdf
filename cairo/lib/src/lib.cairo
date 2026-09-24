@@ -5,11 +5,13 @@
 /// squarings happened without ever running them in a Starknet tx.
 ///
 /// Scheme:
-///   prover computes y = x^(2^T) mod N (T sequential squarings, offchain)
-///   and pi = x^floor(2^T / L) mod N where L = H(x, y, T).
-///   verifier checks, in O(log T) group ops:
+///   prover computes y = x^(2^T) mod N (T sequential squarings, offchain),
+///   outputs its sign-canonical form |y| = min(y, N - y), and
+///   pi = x^floor(2^T / L) mod N where L is a prime derived from
+///   H(N, x, |y|, T, nonce) (hash-to-prime, checked in-program).
+///   verifier checks, in O(log T) group ops, in the signed group Z_N^* / {±1}:
 ///     r = 2^T mod L
-///     pi^L * x^r == y  (mod N)
+///     pi^L * x^r == ±|y|  (mod N)
 ///
 /// Combined with RSW timelock encryption (encryptor knows phi(N) and derives
 /// the key instantly; everyone else must square T times), this gives "decryption
@@ -18,17 +20,32 @@
 ///
 /// Big-int representation: little-endian limbs of 64 bits. Two limb domains:
 ///   N (512-bit demo modulus)   -> N_LIMBS = 8 (32 for 2048-bit)
-///   L (256-bit challenge)      -> L_LIMBS = 4
-/// Barrett reduction uses mu = floor(b^(2k)/N) with k+1 limbs, computed
-/// offchain and passed in (validated in-program, see verify_vdf).
+///   L (251-bit prime challenge) -> native u256; 4 limbs as an exponent
+/// Barrett reduction mod N uses mu = floor(b^(2k)/N) with k+1 limbs, computed
+/// offchain and passed in (validated in-program, see verify_vdf). Arithmetic
+/// mod L uses the native u512-by-u256 division.
 ///
 /// Limbs are u64; multiplication columns accumulate exactly in felt252 and
 /// split once into u128 halves for the carry chain. ref/cairo_model_v2.py
 /// mirrors the limb arithmetic and joint exponentiation.
 
+use core::integer::{u512, u512_safe_div_rem_by_u256};
+use core::math::u256_mul_mod_n;
+
 pub const LIMB_BITS: u32 = 64;
 pub const N_LIMBS: usize = 8; // 512-bit RSA modulus (demo/CI); 32 for 2048-bit production
 pub const L_LIMBS: usize = 4;
+/// Miller-Rabin rounds for the challenge prime. For a random odd 251-bit
+/// candidate with uniform bases, a composite passes 20 rounds with probability
+/// below 2^-107 (Damgard-Landrock-Pomerance average-case bound), so grinding
+/// nonces for a composite challenge is infeasible.
+pub const MR_ROUNDS: usize = 20;
+
+// Poseidon domain tags (short strings).
+pub const INSTANCE_TAG: felt252 = 'VDF_WES_INSTANCE_V1';
+pub const CHALLENGE_TAG: felt252 = 'VDF_WES_CHALLENGE_V1';
+pub const MR_TAG: felt252 = 'VDF_WES_MILLER_RABIN_V1';
+pub const KEY_TAG: felt252 = 'VDF_RSW_KEY_V1';
 
 const TWO64: u128 = 0x10000000000000000;
 const MASK64: u128 = 0xffffffffffffffff;
@@ -297,91 +314,203 @@ pub fn mu_valid(m: Span<u64>, mu: Span<u64>, k: usize) -> bool {
     !limbs_eq(prod2.span(), b2k.span(), 2 * k + 1)
 }
 
-/// Hash of the VDF instance: poseidon(N || x || y || T limbs as felt252s).
-/// Seeds the Fiat-Shamir challenge and is returned by the executable as the
-/// public, instance-binding output.
+/// Hash of the VDF instance: poseidon(INSTANCE_TAG, len(N), N || x || y || T
+/// limbs). Seeds the Fiat-Shamir challenge and is returned by the executable as
+/// the public, instance-binding output. `y` is the sign-canonical output |y|.
 pub fn instance_hash(N: Span<u64>, x: Span<u64>, y: Span<u64>, T_limbs: Span<u64>) -> felt252 {
-    let mut input = ArrayTrait::new();
-    let mut i: usize = 0;
-    while i < N.len() {
-        input.append((*N.at(i)).into());
-        i += 1;
-    }
-    i = 0;
-    while i < x.len() {
-        input.append((*x.at(i)).into());
-        i += 1;
-    }
-    i = 0;
-    while i < y.len() {
-        input.append((*y.at(i)).into());
-        i += 1;
-    }
-    i = 0;
-    while i < T_limbs.len() {
-        input.append((*T_limbs.at(i)).into());
-        i += 1;
-    }
+    let mut input = array![INSTANCE_TAG, N.len().into()];
+    append_limbs(ref input, N);
+    append_limbs(ref input, x);
+    append_limbs(ref input, y);
+    append_limbs(ref input, T_limbs);
     core::poseidon::poseidon_hash_span(input.span())
 }
 
-/// Fiat-Shamir challenge for the Wesolowski proof, derived in-program:
-/// L = instance_hash(N, x, y, T) as 4 u64 limbs with bit 192 forced, so
-/// b^3 <= L < b^4 always satisfies the Barrett precondition. Binding L to the
-/// instance is what makes the proof sound: a prover cannot pick L to fit a
-/// forged y (e.g. L dividing 2^T, which collapses the check to pi == y).
-pub fn derive_challenge(
-    N: Span<u64>, x: Span<u64>, y: Span<u64>, T_limbs: Span<u64>,
-) -> Array<u64> {
-    let h: u256 = instance_hash(N, x, y, T_limbs).into();
-    let low: u128 = h.low;
-    let high: u128 = h.high;
-    let mut out = ArrayTrait::new();
-    out.append((low & MASK64).try_into().unwrap());
-    out.append((low / TWO64).try_into().unwrap());
-    out.append((high & MASK64).try_into().unwrap());
-    let l3: u64 = (high / TWO64).try_into().unwrap();
-    out.append(l3 | 1); // force bit 192: L >= b^3 (Barrett precondition)
-    out
+fn append_limbs(ref out: Array<felt252>, limbs: Span<u64>) {
+    for limb in limbs {
+        out.append((*limb).into());
+    }
 }
 
-/// Wesolowski VDF verification core.
-/// Derives the challenge L = H(N, x, y, T) in-program, validates both Barrett
-/// constants, then returns true iff pi^L * x^(2^T mod L) == y mod N.
+/// Fiat-Shamir seed for the challenge: poseidon(CHALLENGE_TAG, instance, nonce).
+/// The prover increments `nonce` offchain until the candidate is prime.
+pub fn challenge_hash(instance: felt252, nonce: felt252) -> felt252 {
+    core::poseidon::poseidon_hash_span(array![CHALLENGE_TAG, instance, nonce].span())
+}
+
+/// Challenge candidate from its seed: the low 250 bits with bits 250 and 0
+/// forced, so L is odd and 2^250 <= L < 2^251. Primality is checked separately
+/// by `is_probable_prime`.
+pub fn challenge_from_hash(h: felt252) -> u256 {
+    let h: u256 = h.into();
+    u256 {
+        low: h.low | 1,
+        high: (h.high & 0x3ffffffffffffffffffffffffffffff) | 0x4000000000000000000000000000000,
+    }
+}
+
+/// base^exp mod n over native u256 (u512 wide product, exact remainder).
+pub fn u256_pow_mod(base: u256, exp: u256, n: NonZero<u256>) -> u256 {
+    let mut result: u256 = 1;
+    let mut b = u256_mul_mod_n(base, 1, n);
+    let mut e = exp;
+    while e != 0 {
+        if e % 2 == 1 {
+            result = u256_mul_mod_n(result, b, n);
+        }
+        e = e / 2;
+        if e != 0 {
+            b = u256_mul_mod_n(b, b, n);
+        }
+    }
+    result
+}
+
+/// Miller-Rabin with MR_ROUNDS Fiat-Shamir bases derived from `seed`. Each
+/// base is two Poseidon outputs (a 504-bit integer, low || high) reduced mod
+/// L, which is statistically uniform. Requires L odd and L > 3.
+pub fn is_probable_prime(L: u256, seed: felt252) -> bool {
+    let n: NonZero<u256> = L.try_into().unwrap();
+    let l_minus_1 = L - 1;
+    let mut d = l_minus_1;
+    let mut s: usize = 0;
+    while d % 2 == 0 {
+        d = d / 2;
+        s += 1;
+    }
+
+    let mut round: usize = 0;
+    while round < MR_ROUNDS {
+        let lo: u256 = core::poseidon::poseidon_hash_span(
+            array![MR_TAG, seed, (2 * round).into()].span(),
+        )
+            .into();
+        let hi: u256 = core::poseidon::poseidon_hash_span(
+            array![MR_TAG, seed, (2 * round + 1).into()].span(),
+        )
+            .into();
+        let wide = u512 { limb0: lo.low, limb1: lo.high, limb2: hi.low, limb3: hi.high };
+        let (_, base) = u512_safe_div_rem_by_u256(wide, n);
+
+        let mut z = u256_pow_mod(base, d, n);
+        if z != 1 && z != l_minus_1 {
+            let mut witness = true;
+            let mut j: usize = 1;
+            while j < s {
+                z = u256_mul_mod_n(z, z, n);
+                if z == l_minus_1 {
+                    witness = false;
+                    break;
+                }
+                if z == 1 {
+                    break;
+                }
+                j += 1;
+            }
+            if witness {
+                return false;
+            }
+        }
+        round += 1;
+    }
+    true
+}
+
+/// A u256 as 4 little-endian u64 limbs (the exponent format of joint_modpow).
+fn u256_limbs(v: u256) -> Array<u64> {
+    array![
+        (v.low & MASK64).try_into().unwrap(), (v.low / TWO64).try_into().unwrap(),
+        (v.high & MASK64).try_into().unwrap(), (v.high / TWO64).try_into().unwrap(),
+    ]
+}
+
+/// True iff y < N - y, i.e. y is the sign-canonical representative of ±y
+/// (N odd, so y != N - y). Requires y < N.
+fn is_sign_canonical(y: Span<u64>, N: Span<u64>) -> bool {
+    if ge_limbs(y, N, N_LIMBS) {
+        return false;
+    }
+    let neg_y = sub_limbs(N, y, N_LIMBS);
+    !ge_limbs(y, neg_y.span(), N_LIMBS)
+}
+
+/// Wesolowski VDF verification core, in the signed group Z_N^* / {±1}.
+/// `y` must be sign-canonical (y < N - y): accepting only one of ±y removes the
+/// -1 malleability that let anyone who knew y "prove" N - y. The challenge L is
+/// derived in-program from (N, x, y, T, nonce) and must be prime: a composite
+/// challenge admits smooth-challenge forgeries of a wrong y without factoring N.
+/// Returns true iff N is odd, mu_n is exact, L is prime and
+/// pi^L * x^(2^T mod L) == ±y mod N. `T_limbs` is T as two u64 limbs.
 pub fn verify_vdf(
     N: Span<u64>,
     mu_n: Span<u64>,
     x: Span<u64>,
     y: Span<u64>,
     pi: Span<u64>,
-    mu_l: Span<u64>,
     T_limbs: Span<u64>,
-    T_n: usize,
+    nonce: felt252,
 ) -> bool {
-    // 0. the offchain-computed Barrett constants must match their moduli
-    if !mu_valid(N, mu_n, N_LIMBS) {
+    // 0. N odd, the offchain-computed Barrett constant matches N, and y is
+    //    the sign-canonical output.
+    if *N.at(0) % 2 == 0 || !mu_valid(N, mu_n, N_LIMBS) {
         return false;
     }
-    let L = derive_challenge(N, x, y, T_limbs);
-    if !mu_valid(L.span(), mu_l, L_LIMBS) {
+    if !is_sign_canonical(y, N) {
+        return false;
+    }
+    let seed = challenge_hash(instance_hash(N, x, y, T_limbs), nonce);
+    let L = challenge_from_hash(seed);
+    if !is_probable_prime(L, seed) {
         return false;
     }
 
-    // 1. r = 2^T mod L in the L domain
-    let mut two = ArrayTrait::new();
-    two.append(2);
-    let mut i: usize = 1;
-    while i < L_LIMBS {
-        two.append(0);
-        i += 1;
-    }
-    let r = modpow(two.span(), T_limbs, T_n, L.span(), mu_l, L_LIMBS);
+    // 1. r = 2^T mod L (T is two u64 limbs)
+    let T: u256 = (*T_limbs.at(0)).into() + (*T_limbs.at(1)).into() * TWO64.into();
+    let r = u256_pow_mod(2, T, L.try_into().unwrap());
 
     // 2. lhs = pi^L * x^r mod N
-    let lhs = joint_modpow(pi, L.span(), x, r.span(), N, mu_n, N_LIMBS);
+    let lhs = joint_modpow(pi, u256_limbs(L).span(), x, u256_limbs(r).span(), N, mu_n, N_LIMBS);
 
-    // 3. check lhs == y
-    limbs_eq(lhs.span(), y, N_LIMBS)
+    // 3. check lhs == ±y
+    if limbs_eq(lhs.span(), y, N_LIMBS) {
+        return true;
+    }
+    let neg_lhs = sub_limbs(N, lhs.span(), N_LIMBS);
+    limbs_eq(neg_lhs.span(), y, N_LIMBS)
+}
+
+/// RSW key from the sign-canonical VDF output: poseidon(KEY_TAG, ctx, len(y),
+/// y limbs). `ctx` is the application context (e.g. H(auction, bid)), so one
+/// puzzle output never yields the same key in two contexts.
+pub fn derive_key(ctx: felt252, y: Span<u64>) -> felt252 {
+    let mut input = array![KEY_TAG, ctx, y.len().into()];
+    append_limbs(ref input, y);
+    core::poseidon::poseidon_hash_span(input.span())
+}
+
+/// Poseidon keystream: ks_i = poseidon(key, i); ct_i = pt_i + ks_i in the field.
+/// No integrity tag: the application binds the plaintext by comparing its hash
+/// against the commitment posted with the ciphertext.
+pub fn decrypt(key: felt252, ct: Span<felt252>) -> Array<felt252> {
+    let mut pt = ArrayTrait::new();
+    let mut i: usize = 0;
+    while i < ct.len() {
+        let ks = core::poseidon::poseidon_hash_span(array![key, i.into()].span());
+        pt.append(*ct.at(i) - ks);
+        i += 1;
+    }
+    pt
+}
+
+pub fn encrypt(key: felt252, pt: Span<felt252>) -> Array<felt252> {
+    let mut ct = ArrayTrait::new();
+    let mut i: usize = 0;
+    while i < pt.len() {
+        let ks = core::poseidon::poseidon_hash_span(array![key, i.into()].span());
+        ct.append(*pt.at(i) + ks);
+        i += 1;
+    }
+    ct
 }
 
 /// a^e * b^f mod N for two L_LIMBS-limb exponents, sharing each squaring.
